@@ -28,16 +28,35 @@ speed = st.slider(
     step=10
 )
 
+retry_rounds = st.slider(
+    "Max retry rounds per chat",
+    min_value=3,
+    max_value=30,
+    value=12,
+    step=1,
+    help="The script will keep retrying visible failed messages until they disappear or this limit is reached."
+)
+
+no_progress_rounds = st.slider(
+    "Stop after this many no-progress rounds",
+    min_value=2,
+    max_value=10,
+    value=4,
+    step=1,
+    help="Stops a chat if Reddit refuses to delete messages repeatedly."
+)
+
 generate = st.button(
-    "Generate selected-chat delete script",
+    "Generate selected-chat retry delete script",
     type="primary",
     use_container_width=True
 )
 
 JS_TEMPLATE = r"""
-// Reddit Selected-Chat Own-Message Bulk Delete
+// Reddit Selected-Chat Own-Message Bulk Delete with Retry
 // Shows a checkbox picker first.
 // Deletes only YOUR sent messages in the selected chats.
+// Retries failed visible messages until they disappear or the safety limit is reached.
 // Does NOT delete comments.
 // Does NOT delete posts.
 // Works on Reddit chat pages even if the URL is not exactly /chat.
@@ -47,12 +66,17 @@ JS_TEMPLATE = r"""
   const USERNAME = __USERNAME_JSON__;
   const MAX_DELETES_PER_MINUTE = __MAX_DELETES__;
 
+  const MAX_RETRY_ROUNDS_PER_CHAT = __MAX_RETRY_ROUNDS__;
+  const MAX_NO_PROGRESS_ROUNDS = __MAX_NO_PROGRESS_ROUNDS__;
+
   const DELETE_DELAY_MS = Math.ceil(60000 / MAX_DELETES_PER_MINUTE);
   const SHORT_DELAY_MS = 100;
   const MENU_DELAY_MS = 150;
   const CONFIRM_DELAY_MS = 150;
   const SCROLL_DELAY_MS = 600;
   const CHAT_SWITCH_DELAY_MS = 1800;
+  const GONE_CHECK_TIMEOUT_MS = 2500;
+  const GONE_CHECK_INTERVAL_MS = 150;
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -211,6 +235,28 @@ JS_TEMPLATE = r"""
     return false;
   };
 
+  const waitUntilMessageGone = async (eventEl) => {
+    const started = Date.now();
+
+    while (Date.now() - started < GONE_CHECK_TIMEOUT_MS) {
+      await sleep(GONE_CHECK_INTERVAL_MS);
+
+      if (!document.contains(eventEl)) {
+        return true;
+      }
+
+      if (!isVisible(eventEl)) {
+        return true;
+      }
+
+      if (!isOwnMessage(eventEl)) {
+        return true;
+      }
+    }
+
+    return false;
+  };
+
   const deleteOne = async (eventEl) => {
     eventEl.scrollIntoView({ block: "center" });
 
@@ -270,7 +316,9 @@ JS_TEMPLATE = r"""
     await confirmDeleteDialog();
     await sleep(DELETE_DELAY_MS);
 
-    return true;
+    const gone = await waitUntilMessageGone(eventEl);
+
+    return gone;
   };
 
   const getOwnMessageEvents = () =>
@@ -313,43 +361,75 @@ JS_TEMPLATE = r"""
   const deleteCurrentChatMessages = async () => {
     let deleted = 0;
     let failed = 0;
-    let lastCount = -1;
-    let stuckRounds = 0;
+    let retryRounds = 0;
+    let noProgressRounds = 0;
+    let lastRemainingCount = Infinity;
 
-    while (true) {
-      const ownMessages = getOwnMessageEvents();
+    while (retryRounds < MAX_RETRY_ROUNDS_PER_CHAT) {
+      retryRounds++;
+
+      console.log(`Retry round ${retryRounds}/${MAX_RETRY_ROUNDS_PER_CHAT} for this chat...`);
+
+      let roundDeleted = 0;
+      let roundFailed = 0;
+
+      let ownMessages = getOwnMessageEvents();
 
       if (ownMessages.length === 0) {
-        stuckRounds++;
-      } else {
-        stuckRounds = 0;
+        await scrollCurrentChatUp();
+        ownMessages = getOwnMessageEvents();
       }
+
+      if (ownMessages.length === 0) {
+        console.log("No visible own messages left in this chat.");
+        break;
+      }
+
+      console.log(`Found ${ownMessages.length} visible own message(s) to try deleting.`);
 
       for (const msg of ownMessages) {
         const ok = await deleteOne(msg);
 
         if (ok) {
           deleted++;
-          console.log(`Deleted ${deleted} message(s) in this chat...`);
+          roundDeleted++;
+          console.log(`Deleted ${deleted} total message(s) in this chat...`);
         } else {
           failed++;
-          console.log(`Skipped/failed ${failed} message(s) in this chat...`);
+          roundFailed++;
+          console.log("Delete attempt failed. It will retry if the message remains visible.");
         }
       }
 
       await scrollCurrentChatUp();
 
-      const currentCount = getOwnMessageEvents().length;
+      const remaining = getOwnMessageEvents().length;
 
-      if (currentCount === lastCount) {
-        stuckRounds++;
-      }
+      console.log(
+        `Round ${retryRounds} done. Deleted this round: ${roundDeleted}. Failed this round: ${roundFailed}. Remaining visible own messages: ${remaining}.`
+      );
 
-      lastCount = currentCount;
-
-      if (stuckRounds >= 3) {
+      if (remaining === 0) {
+        console.log("All visible own messages are gone in this chat.");
         break;
       }
+
+      if (remaining >= lastRemainingCount && roundDeleted === 0) {
+        noProgressRounds++;
+      } else {
+        noProgressRounds = 0;
+      }
+
+      lastRemainingCount = remaining;
+
+      if (noProgressRounds >= MAX_NO_PROGRESS_ROUNDS) {
+        console.warn(
+          "Stopping this chat because repeated retry rounds made no progress. Reddit may be refusing deletion, the UI changed, or these messages may not be deletable."
+        );
+        break;
+      }
+
+      await sleep(1000);
     }
 
     return { deleted, failed };
@@ -637,6 +717,7 @@ JS_TEMPLATE = r"""
   console.log("Current URL:", location.href);
   console.log("Tip: the URL does not need to be exactly /chat.");
   console.log("Tip: scroll the left chat sidebar before running if you want more chats to appear.");
+  console.log(`Retry settings: ${MAX_RETRY_ROUNDS_PER_CHAT} retry rounds per chat, stop after ${MAX_NO_PROGRESS_ROUNDS} no-progress rounds.`);
 
   const selectedChats = await showChatPicker();
 
@@ -670,17 +751,17 @@ JS_TEMPLATE = r"""
     totalFailed += result.failed;
 
     console.log(
-      `Finished chat: ${chat.text}. Deleted: ${result.deleted}. Failed/skipped: ${result.failed}.`
+      `Finished chat: ${chat.text}. Deleted: ${result.deleted}. Failed/skipped attempts: ${result.failed}.`
     );
   }
 
   console.log("Selected-chat cleanup finished.");
   console.log(`Chats processed: ${processedChats}`);
   console.log(`Total deleted: ${totalDeleted}`);
-  console.log(`Total skipped/failed: ${totalFailed}`);
+  console.log(`Total skipped/failed attempts: ${totalFailed}`);
 
   if (totalFailed > 0) {
-    console.log("If many messages failed, run again with a slower speed like 60.");
+    console.log("If many messages failed, run again with a slower speed like 60 or increase retry rounds.");
   }
 })();
 """
@@ -693,6 +774,8 @@ if generate:
             JS_TEMPLATE
             .replace("__USERNAME_JSON__", json.dumps(username.strip()))
             .replace("__MAX_DELETES__", str(int(speed)))
+            .replace("__MAX_RETRY_ROUNDS__", str(int(retry_rounds)))
+            .replace("__MAX_NO_PROGRESS_ROUNDS__", str(int(no_progress_rounds)))
             .strip()
         )
 
@@ -711,6 +794,8 @@ if generate:
             7. Paste the generated script.
             8. Select the chats in the popup.
             9. Click **Delete selected chats**.
+
+            The script will retry visible failed messages until they disappear or until the safety stop is reached.
             """
         )
 
@@ -719,7 +804,7 @@ if generate:
         st.download_button(
             label="Download script as .js",
             data=script,
-            file_name="reddit_selected_chat_delete.js",
+            file_name="reddit_selected_chat_retry_delete.js",
             mime="text/javascript",
             use_container_width=True
         )
