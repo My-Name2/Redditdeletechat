@@ -8,7 +8,7 @@ st.set_page_config(
 )
 
 st.title("Reddit Chat Delete Script Generator")
-st.caption("Generate a selected-chat delete script, then paste it into Reddit's DevTools Console.")
+st.caption("Generate a selected-chat delete/hide script, then paste it into Reddit's DevTools Console.")
 
 st.warning(
     "Hosted Streamlit apps cannot directly control reddit.com in your browser. "
@@ -46,31 +46,36 @@ no_progress_rounds = st.slider(
     help="Stops a chat if Reddit refuses to delete messages repeatedly."
 )
 
+hide_after_delete = st.checkbox(
+    "Hide selected chats after cleaning",
+    value=True,
+    help="After deleting your sent messages in a selected chat, the script will try to click Reddit's Hide Chat option."
+)
+
 generate = st.button(
-    "Generate selected-chat retry delete script",
+    "Generate selected-chat delete/hide script",
     type="primary",
     use_container_width=True
 )
 
 JS_TEMPLATE = r"""
-// Reddit Selected-Chat Own-Message Bulk Delete with Retry + Sidebar Recovery
+// Reddit Selected-Chat Own-Message Bulk Delete with Retry + Hide + Deleted-User Chat Support
 // Shows a checkbox picker first.
 // Deletes only YOUR sent messages in the selected chats.
 // Retries failed visible messages until they disappear or the safety limit is reached.
+// Can hide selected chats after cleaning.
+// Handles chats named [deleted] as visible chat rows.
 // Does NOT delete comments.
 // Does NOT delete posts.
 // Works on Reddit chat pages even if the URL is not exactly /chat.
 // Run on any Reddit chat page where the left chat sidebar is visible.
-//
-// Tip: If Reddit hides the sidebar after opening a chat, this version tries Back/history.back()
-// before moving to the next selected chat.
 
 (async () => {
   const USERNAME = __USERNAME_JSON__;
   const MAX_DELETES_PER_MINUTE = __MAX_DELETES__;
-
   const MAX_RETRY_ROUNDS_PER_CHAT = __MAX_RETRY_ROUNDS__;
   const MAX_NO_PROGRESS_ROUNDS = __MAX_NO_PROGRESS_ROUNDS__;
+  const HIDE_AFTER_DELETE = __HIDE_AFTER_DELETE__;
 
   const DELETE_DELAY_MS = Math.ceil(60000 / MAX_DELETES_PER_MINUTE);
   const SHORT_DELAY_MS = 100;
@@ -79,6 +84,7 @@ JS_TEMPLATE = r"""
   const SCROLL_DELAY_MS = 600;
   const CHAT_SWITCH_DELAY_MS = 1800;
   const SIDEBAR_RECOVERY_DELAY_MS = 1400;
+  const HIDE_DELAY_MS = 1000;
   const GONE_CHECK_TIMEOUT_MS = 2500;
   const GONE_CHECK_INTERVAL_MS = 150;
 
@@ -178,19 +184,22 @@ JS_TEMPLATE = r"""
       .trim();
   };
 
-  const getChatKey = (el) => {
+  const normalizeTextForMatch = (text) => {
+    return cleanText(text)
+      .toLowerCase()
+      .replace(/\s+/g, " ");
+  };
+
+  const getElementHref = (el) => {
     const link = localQuery(el, "a");
 
-    const href =
+    return (
       el.href ||
       el.getAttribute("href") ||
       link?.href ||
       link?.getAttribute("href") ||
-      "";
-
-    const text = cleanText(getReadableText(el)).slice(0, 180);
-
-    return href || text;
+      ""
+    );
   };
 
   const isOwnMessage = (eventEl) => {
@@ -468,7 +477,7 @@ JS_TEMPLATE = r"""
           r.width >= 90 &&
           r.width <= window.innerWidth * 0.6 &&
           r.height >= 24 &&
-          r.height <= 170;
+          r.height <= 190;
 
         const notTopNav = r.top > 55;
 
@@ -480,31 +489,47 @@ JS_TEMPLATE = r"""
         return inLeftSidebar && notTopNav && notObviousBadItem;
       });
 
+    const sorted = raw.sort((a, b) => {
+      const ar = a.getBoundingClientRect();
+      const br = b.getBoundingClientRect();
+
+      if (Math.abs(ar.top - br.top) > 8) return ar.top - br.top;
+      return ar.left - br.left;
+    });
+
     const unique = [];
     const seen = new Set();
+    const duplicateCounter = new Map();
 
-    for (const el of raw) {
+    for (const el of sorted) {
       const r = el.getBoundingClientRect();
+      const href = getElementHref(el);
+      const text = cleanText(getReadableText(el)).slice(0, 220);
+      const normalizedText = normalizeTextForMatch(text);
 
-      const link = localQuery(el, "a");
+      const currentDupIndex = duplicateCounter.get(normalizedText) || 0;
+      duplicateCounter.set(normalizedText, currentDupIndex + 1);
 
-      const href =
-        el.href ||
-        el.getAttribute("href") ||
-        link?.href ||
-        link?.getAttribute("href") ||
-        "";
-
-      const text = cleanText(getReadableText(el)).slice(0, 180);
-      const key = href || text;
+      const baseKey = href || normalizedText || text;
+      const geometryKey = `${Math.round(r.top)}:${Math.round(r.left)}:${Math.round(r.width)}:${Math.round(r.height)}`;
+      const key = href || `${baseKey}::dup${currentDupIndex}::${geometryKey}`;
 
       if (!key || seen.has(key)) continue;
 
       seen.add(key);
 
+      let displayText = text || href || "[unknown chat]";
+
+      if (normalizedText === "[deleted]" || displayText.toLowerCase().includes("[deleted]")) {
+        displayText = `[deleted chat] ${displayText}`;
+      }
+
       unique.push({
         key,
-        text: text || key,
+        text: displayText,
+        rawText: text,
+        normalizedText,
+        duplicateIndex: currentDupIndex,
         href,
         top: Math.round(r.top),
         left: Math.round(r.left),
@@ -519,7 +544,9 @@ JS_TEMPLATE = r"""
       unique.map((chat, i) => ({
         number: i + 1,
         text: chat.text,
+        rawText: chat.rawText,
         href: chat.href,
+        duplicateIndex: chat.duplicateIndex,
         top: chat.top,
         left: chat.left,
         width: chat.width,
@@ -593,24 +620,61 @@ JS_TEMPLATE = r"""
     return false;
   };
 
-  const findChatElementByKey = async (key, fallbackText = "") => {
+  const findChatElementFromSavedChat = async (savedChat) => {
     await returnToChatListIfNeeded();
 
     const candidates = getChatCandidates();
 
-    let match = candidates.find((chat) => chat.key === key);
+    let match = null;
 
-    if (!match && fallbackText) {
-      const cleanedFallback = cleanText(fallbackText).toLowerCase();
+    if (savedChat.href) {
+      match = candidates.find((chat) => chat.href === savedChat.href);
+    }
+
+    if (!match && savedChat.key) {
+      match = candidates.find((chat) => chat.key === savedChat.key);
+    }
+
+    if (!match && savedChat.normalizedText) {
+      match = candidates.find((chat) => {
+        return (
+          chat.normalizedText === savedChat.normalizedText &&
+          chat.duplicateIndex === savedChat.duplicateIndex
+        );
+      });
+    }
+
+    if (!match && savedChat.rawText) {
+      const savedRaw = normalizeTextForMatch(savedChat.rawText);
 
       match = candidates.find((chat) => {
-        const cleanedCandidate = cleanText(chat.text).toLowerCase();
+        const currentRaw = normalizeTextForMatch(chat.rawText);
 
         return (
-          cleanedCandidate === cleanedFallback ||
-          cleanedCandidate.includes(cleanedFallback) ||
-          cleanedFallback.includes(cleanedCandidate)
+          currentRaw === savedRaw ||
+          currentRaw.includes(savedRaw) ||
+          savedRaw.includes(currentRaw)
         );
+      });
+    }
+
+    if (!match && savedChat.text) {
+      const savedDisplay = normalizeTextForMatch(savedChat.text);
+
+      match = candidates.find((chat) => {
+        const currentDisplay = normalizeTextForMatch(chat.text);
+
+        return (
+          currentDisplay === savedDisplay ||
+          currentDisplay.includes(savedDisplay) ||
+          savedDisplay.includes(currentDisplay)
+        );
+      });
+    }
+
+    if (!match && savedChat.normalizedText === "[deleted]") {
+      match = candidates.find((chat) => {
+        return chat.normalizedText === "[deleted]" || chat.text.toLowerCase().includes("[deleted]");
       });
     }
 
@@ -621,25 +685,148 @@ JS_TEMPLATE = r"""
     return null;
   };
 
-  const clickChatByKey = async (key, fallbackText) => {
-    const chatEl = await findChatElementByKey(key, fallbackText);
+  const clickChat = async (savedChat) => {
+    const chatEl = await findChatElementFromSavedChat(savedChat);
 
     if (!chatEl) {
-      console.warn(`Could not find chat again: ${fallbackText || key}`);
+      console.warn(`Could not find chat again: ${savedChat.text || savedChat.rawText || savedChat.key}`);
       return false;
     }
 
     chatEl.scrollIntoView({ block: "center" });
     await sleep(300);
 
-    console.log(`Opening selected chat: ${fallbackText || key}`);
+    console.log(`Opening selected chat: ${savedChat.text || savedChat.rawText || savedChat.key}`);
 
-    // Use a real click instead of location.href. This helps keep Reddit's sidebar layout alive.
     chatEl.click();
 
     await sleep(CHAT_SWITCH_DELAY_MS);
 
     return true;
+  };
+
+  const findHideChatItem = () => {
+    const items = deepQueryAll(
+      [
+        '[role="menuitem"]',
+        'rs-menu-item',
+        'rs-dropdown-item',
+        'button',
+        '[role="button"]'
+      ].join(",")
+    ).filter(isVisible);
+
+    return items.find((el) => {
+      const text = cleanText(getReadableText(el)).toLowerCase();
+
+      return (
+        text === "hide chat" ||
+        text === "hide" ||
+        /hide\s+chat/i.test(text)
+      );
+    });
+  };
+
+  const clickConfirmHideIfNeeded = async () => {
+    await sleep(500);
+
+    const buttons = deepQueryAll(
+      [
+        'button',
+        '[role="button"]',
+        'rs-button'
+      ].join(",")
+    ).filter(isVisible);
+
+    const confirm = buttons.find((button) => {
+      const text = cleanText(getReadableText(button)).toLowerCase();
+
+      return (
+        text === "hide" ||
+        text === "hide chat" ||
+        text === "yes, hide" ||
+        text === "confirm"
+      );
+    });
+
+    if (confirm) {
+      confirm.click();
+      await sleep(HIDE_DELAY_MS);
+      return true;
+    }
+
+    return false;
+  };
+
+  const hideCurrentChat = async () => {
+    console.log("Trying to hide current chat...");
+
+    let hideItem = findHideChatItem();
+
+    if (hideItem) {
+      hideItem.click();
+      await clickConfirmHideIfNeeded();
+      console.log("Hide Chat clicked.");
+      return true;
+    }
+
+    const menuCandidates = deepQueryAll(
+      [
+        'button[aria-label*="settings" i]',
+        'button[title*="settings" i]',
+        '[aria-label*="settings" i]',
+        '[title*="settings" i]',
+        'button[aria-label*="more" i]',
+        'button[title*="more" i]',
+        '[aria-label*="more" i]',
+        '[title*="more" i]',
+        'button[aria-label*="options" i]',
+        '[aria-label*="options" i]',
+        'button[aria-haspopup="menu"]',
+        '[role="button"][aria-haspopup="menu"]',
+        'rs-icon-button[icon="settings"]',
+        'rs-icon-button[name="settings"]',
+        'rs-icon-button[icon="more"]',
+        'rs-icon-button[name="more"]'
+      ].join(",")
+    )
+      .filter(isVisible)
+      .filter((el) => {
+        const r = el.getBoundingClientRect();
+
+        return (
+          r.top > 40 &&
+          r.top < Math.max(240, window.innerHeight * 0.35) &&
+          r.left > window.innerWidth * 0.25
+        );
+      })
+      .sort((a, b) => {
+        const ar = a.getBoundingClientRect();
+        const br = b.getBoundingClientRect();
+
+        if (Math.abs(br.left - ar.left) > 10) {
+          return br.left - ar.left;
+        }
+
+        return ar.top - br.top;
+      });
+
+    for (const button of menuCandidates) {
+      button.click();
+      await sleep(700);
+
+      hideItem = findHideChatItem();
+
+      if (hideItem) {
+        hideItem.click();
+        await clickConfirmHideIfNeeded();
+        console.log("Hide Chat clicked.");
+        return true;
+      }
+    }
+
+    console.warn("Could not find Hide Chat for this conversation.");
+    return false;
   };
 
   const showChatPicker = async () => {
@@ -669,7 +856,7 @@ JS_TEMPLATE = r"""
       overlay.style.fontFamily = "Arial, sans-serif";
 
       const panel = document.createElement("div");
-      panel.style.width = "min(760px, 92vw)";
+      panel.style.width = "min(780px, 92vw)";
       panel.style.maxHeight = "82vh";
       panel.style.overflow = "auto";
       panel.style.background = "#fff";
@@ -686,8 +873,13 @@ JS_TEMPLATE = r"""
         </p>
 
         <p style="margin:0 0 12px;font-size:13px;line-height:1.4;color:#555;">
-          If a chat is missing, cancel this popup, scroll the left Reddit chat sidebar to load more chats,
-          then run the script again. If the script only processes one chat, undock DevTools or widen the Reddit window.
+          [deleted] chats are included if Reddit shows them in the sidebar. If a chat is missing,
+          cancel this popup, scroll the left Reddit chat sidebar to load more chats, then run the script again.
+          If the script only processes one chat, undock DevTools or widen the Reddit window.
+        </p>
+
+        <p style="margin:0 0 12px;font-size:13px;line-height:1.4;color:#555;">
+          Hide after cleaning: <b>${HIDE_AFTER_DELETE ? "ON" : "OFF"}</b>
         </p>
 
         <div style="display:flex;gap:8px;margin-bottom:12px;">
@@ -710,7 +902,7 @@ JS_TEMPLATE = r"""
       chats.forEach((chat, index) => {
         const row = document.createElement("label");
         row.style.display = "flex";
-        row.style.alignItems = "center";
+        row.style.alignItems = "flex-start";
         row.style.gap = "10px";
         row.style.padding = "10px";
         row.style.borderBottom = "1px solid #eee";
@@ -721,9 +913,16 @@ JS_TEMPLATE = r"""
         checkbox.type = "checkbox";
         checkbox.checked = false;
         checkbox.dataset.index = String(index);
+        checkbox.style.marginTop = "3px";
 
         const label = document.createElement("span");
-        label.textContent = `${index + 1}. ${chat.text}`;
+
+        const duplicateNote =
+          chat.duplicateIndex > 0
+            ? ` duplicate #${chat.duplicateIndex + 1}`
+            : "";
+
+        label.textContent = `${index + 1}. ${chat.text}${duplicateNote}`;
 
         row.appendChild(checkbox);
         row.appendChild(label);
@@ -762,6 +961,9 @@ JS_TEMPLATE = r"""
         const selected = selectedIndexes.map((i) => ({
           key: chats[i].key,
           text: chats[i].text,
+          rawText: chats[i].rawText,
+          normalizedText: chats[i].normalizedText,
+          duplicateIndex: chats[i].duplicateIndex,
           href: chats[i].href
         }));
 
@@ -773,9 +975,11 @@ JS_TEMPLATE = r"""
   console.log("Scanning visible chats...");
   console.log("Current URL:", location.href);
   console.log("Tip: the URL does not need to be exactly /chat.");
+  console.log("Tip: [deleted] chat rows are included if Reddit renders them in the sidebar.");
   console.log("Tip: scroll the left chat sidebar before running if you want more chats to appear.");
   console.log("Tip: if only one chat processes, undock DevTools or widen the Reddit window.");
   console.log(`Retry settings: ${MAX_RETRY_ROUNDS_PER_CHAT} retry rounds per chat, stop after ${MAX_NO_PROGRESS_ROUNDS} no-progress rounds.`);
+  console.log(`Hide after delete: ${HIDE_AFTER_DELETE ? "ON" : "OFF"}`);
 
   const selectedChats = await showChatPicker();
 
@@ -789,10 +993,12 @@ JS_TEMPLATE = r"""
 
   let totalDeleted = 0;
   let totalFailed = 0;
+  let totalHidden = 0;
+  let totalHideFailed = 0;
   let processedChats = 0;
 
   for (const chat of selectedChats) {
-    const opened = await clickChatByKey(chat.key, chat.text);
+    const opened = await clickChat(chat);
 
     if (!opened) {
       totalFailed++;
@@ -812,17 +1018,36 @@ JS_TEMPLATE = r"""
       `Finished chat: ${chat.text}. Deleted: ${result.deleted}. Failed/skipped attempts: ${result.failed}.`
     );
 
-    // After each chat, try to restore the chat list before the next loop.
+    if (HIDE_AFTER_DELETE) {
+      const hidden = await hideCurrentChat();
+
+      if (hidden) {
+        totalHidden++;
+        console.log(`Hidden chat: ${chat.text}`);
+      } else {
+        totalHideFailed++;
+        console.warn(`Could not hide chat: ${chat.text}`);
+      }
+
+      await sleep(1200);
+    }
+
     await returnToChatListIfNeeded();
   }
 
   console.log("Selected-chat cleanup finished.");
   console.log(`Chats processed: ${processedChats}`);
   console.log(`Total deleted: ${totalDeleted}`);
-  console.log(`Total skipped/failed attempts: ${totalFailed}`);
+  console.log(`Total skipped/failed delete attempts: ${totalFailed}`);
+  console.log(`Total hidden: ${totalHidden}`);
+  console.log(`Total hide failures: ${totalHideFailed}`);
 
   if (totalFailed > 0) {
     console.log("If many messages failed, run again with a slower speed like 60 or increase retry rounds.");
+  }
+
+  if (totalHideFailed > 0) {
+    console.log("If hiding failed, Reddit may have changed the chat menu. Try widening the window or manually hide those chats.");
   }
 })();
 """
@@ -837,6 +1062,7 @@ if generate:
             .replace("__MAX_DELETES__", str(int(speed)))
             .replace("__MAX_RETRY_ROUNDS__", str(int(retry_rounds)))
             .replace("__MAX_NO_PROGRESS_ROUNDS__", str(int(no_progress_rounds)))
+            .replace("__HIDE_AFTER_DELETE__", "true" if hide_after_delete else "false")
             .strip()
         )
 
@@ -857,7 +1083,7 @@ if generate:
             9. Select the chats in the popup.
             10. Click **Delete selected chats**.
 
-            This version tries to recover the sidebar after each chat before moving to the next one.
+            `[deleted]` chats are included if Reddit renders them in the sidebar. If there are several identical `[deleted]` rows with no unique link, the script labels duplicates as best it can.
             """
         )
 
@@ -866,7 +1092,7 @@ if generate:
         st.download_button(
             label="Download script as .js",
             data=script,
-            file_name="reddit_selected_chat_retry_delete_sidebar_recovery.js",
+            file_name="reddit_selected_chat_retry_delete_hide_deleted_support.js",
             mime="text/javascript",
             use_container_width=True
         )
