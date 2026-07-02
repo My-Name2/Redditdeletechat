@@ -2,13 +2,13 @@ import json
 import streamlit as st
 
 st.set_page_config(
-    page_title="Reddit Single Chat Auto Delete/Hide",
+    page_title="Reddit Chat Woodchipper Auto Delete/Hide",
     page_icon="🧹",
     layout="centered"
 )
 
-st.title("Reddit Single Chat Auto Delete/Hide")
-st.caption("Generate a script for ONE already-open Reddit chat, then paste it into Reddit's DevTools Console.")
+st.title("Reddit Chat Woodchipper Auto Delete/Hide")
+st.caption("Generate a script that waits for each open Reddit chat, then paste it into Reddit's DevTools Console.")
 
 st.warning(
     "Hosted Streamlit apps cannot directly control reddit.com. "
@@ -24,7 +24,7 @@ st.markdown(
     3. Generate the script below.
     4. Paste it into DevTools → Console on Reddit.
     5. It deletes only your sent chat messages.
-    6. It then automatically hides that same chat.
+    6. It then automatically hides that same chat and waits for you to open another one.
     """
 )
 
@@ -65,13 +65,31 @@ max_empty_scroll_rounds = st.slider(
     help="The script scrolls upward to look for older messages. This controls when it gives up."
 )
 
+max_chats_to_process = st.slider(
+    "Woodchipper mode: max chats to process before stopping",
+    min_value=1,
+    max_value=200,
+    value=25,
+    step=1,
+    help="The script cleans/hides the currently open chat, then waits for you to open the next one."
+)
+
+wait_for_next_chat_seconds = st.slider(
+    "Stop waiting for next chat after this many seconds",
+    min_value=30,
+    max_value=3600,
+    value=900,
+    step=30,
+    help="After a chat is hidden, the script waits this long for you to open another chat."
+)
+
 hide_after_delete = st.checkbox(
-    "Automatically hide this open chat after delete pass",
+    "Automatically hide each open chat after delete pass",
     value=True
 )
 
 generate = st.button(
-    "Generate single-chat auto script",
+    "Generate woodchipper script",
     type="primary",
     use_container_width=True
 )
@@ -97,6 +115,8 @@ JS_TEMPLATE = r"""
   const MAX_NO_PROGRESS_ATTEMPTS = __MAX_NO_PROGRESS_ATTEMPTS__;
   const MAX_EMPTY_SCROLL_ROUNDS = __MAX_EMPTY_SCROLL_ROUNDS__;
   const HIDE_AFTER_DELETE = __HIDE_AFTER_DELETE__;
+  const MAX_CHATS_TO_PROCESS = __MAX_CHATS_TO_PROCESS__;
+  const WAIT_FOR_NEXT_CHAT_SECONDS = __WAIT_FOR_NEXT_CHAT_SECONDS__;
 
   const SHORT_DELAY_MS = 150;
   const MENU_DELAY_MS = 250;
@@ -869,41 +889,250 @@ JS_TEMPLATE = r"""
     return true;
   };
 
-  console.log("Single open-chat cleanup started.");
-  console.log("Make sure the chat you want is already open.");
-  console.log(`Username: ${USERNAME}`);
+  const getCurrentChatHeaderText = () => {
+    const candidates = deepQueryAll("h1, h2, h3, a, span, div")
+      .filter(isVisible)
+      .map((el) => {
+        const r = el.getBoundingClientRect();
+        const text = cleanText(getReadableText(el));
 
-  if (isWelcomeScreen()) {
-    console.warn("This looks like Reddit's Welcome to chat screen, not an open chat. Open one chat first, then run again.");
-    return;
-  }
+        return {
+          el,
+          r,
+          text
+        };
+      })
+      .filter((item) => {
+        const text = item.text;
+        const r = item.r;
 
-  const deleteResult = await deleteOpenChatMessages();
+        if (!text || text.length < 2 || text.length > 120) return false;
 
-  console.log("Delete pass finished.");
-  console.log(`Deleted: ${deleteResult.deleted}`);
-  console.log(`Failed/skipped delete attempts: ${deleteResult.failed}`);
-  console.log(`Total delete attempts: ${deleteResult.totalAttempts}`);
+        const bad =
+          /welcome|start new chat|message$|manage notifications|persistent messaging|pin chat|hide chat|chat settings|reddit|chats|threads/i.test(text);
 
-  if (window.__redditSingleChatCleanupStop) {
-    console.warn("Stopped by user before hide step.");
-    return;
-  }
+        return (
+          !bad &&
+          r.top >= 0 &&
+          r.top < 120 &&
+          r.left > sidebarRight() - 20 &&
+          r.right < window.innerWidth + 20
+        );
+      })
+      .sort((a, b) => {
+        const aScore =
+          (a.text.startsWith("u/") ? 1000 : 0) +
+          (a.r.top < 70 ? 300 : 0) -
+          a.text.length;
 
-  if (!HIDE_AFTER_DELETE) {
-    console.log("Automatic hide disabled in Streamlit settings.");
-    return;
-  }
+        const bScore =
+          (b.text.startsWith("u/") ? 1000 : 0) +
+          (b.r.top < 70 ? 300 : 0) -
+          b.text.length;
 
-  console.log("Automatic hide is enabled. Hiding this chat now...");
+        return bScore - aScore;
+      });
 
-  const hidden = await hideCurrentChat();
+    return candidates[0]?.text || "";
+  };
 
-  if (hidden) {
-    console.log("Done. Current chat was hidden.");
-  } else {
+  const isChatOpenForCleanup = () => {
+    if (isWelcomeScreen()) return false;
+    if (isDeleteMessageModalOpen()) return true;
+    if (isHideChatModalOpen()) return true;
+
+    const hasMessageInput = deepQueryAll(
+      "textarea, input, [contenteditable='true'], [role='textbox']"
+    )
+      .filter(isVisible)
+      .some((el) => {
+        const r = el.getBoundingClientRect();
+        return r.left > sidebarRight() - 30 && r.top > 120;
+      });
+
+    if (hasMessageInput) return true;
+    if (findChatSettingsGear()) return true;
+    if (getOwnMessageEvents().length > 0) return true;
+    if (getCurrentChatHeaderText()) return true;
+
+    return false;
+  };
+
+  const getCurrentChatIdentity = () => {
+    if (!isChatOpenForCleanup()) return "";
+
+    const header = getCurrentChatHeaderText();
+    const visibleOwnMessages = getOwnMessageEvents()
+      .slice(-2)
+      .map(getMessageSignature)
+      .join(" || ");
+
+    return normalizeText(
+      [
+        location.href,
+        header,
+        visibleOwnMessages
+      ].join(" :: ")
+    );
+  };
+
+  const waitForChatToSettle = async () => {
+    await sleep(900);
+
+    const first = getCurrentChatIdentity();
+
+    await sleep(700);
+
+    const second = getCurrentChatIdentity();
+
+    return second || first;
+  };
+
+  const waitForNextOpenChat = async (lastProcessedIdentity) => {
+    const started = Date.now();
+    let lastLog = 0;
+
+    while (!window.__redditSingleChatCleanupStop) {
+      const elapsedSeconds = Math.floor((Date.now() - started) / 1000);
+
+      if (elapsedSeconds > WAIT_FOR_NEXT_CHAT_SECONDS) {
+        console.warn(`Timed out waiting for another chat after ${WAIT_FOR_NEXT_CHAT_SECONDS} seconds.`);
+        return null;
+      }
+
+      if (isChatOpenForCleanup()) {
+        const identity = await waitForChatToSettle();
+
+        if (identity && identity !== lastProcessedIdentity) {
+          console.log("Detected an open chat to woodchip.");
+          return {
+            identity
+          };
+        }
+      }
+
+      if (Date.now() - lastLog > 5000) {
+        const remaining = WAIT_FOR_NEXT_CHAT_SECONDS - elapsedSeconds;
+        console.log(`Waiting for you to open another chat... ${remaining}s left. Stop with: window.__redditSingleChatCleanupStop = true`);
+        lastLog = Date.now();
+      }
+
+      await sleep(1000);
+    }
+
+    return null;
+  };
+
+  const waitUntilCurrentChatChangesOrCloses = async (processedIdentity) => {
+    const started = Date.now();
+
+    while (Date.now() - started < 8000) {
+      await sleep(500);
+
+      const currentIdentity = getCurrentChatIdentity();
+
+      if (!currentIdentity || currentIdentity !== processedIdentity || isWelcomeScreen()) {
+        return true;
+      }
+    }
+
+    return false;
+  };
+
+  const processCurrentlyOpenChat = async (chatNumber, chatIdentity) => {
+    console.log(`Woodchipper pass ${chatNumber}/${MAX_CHATS_TO_PROCESS} started.`);
+    console.log(`Current chat identity: ${chatIdentity.slice(0, 180)}`);
+
+    const deleteResult = await deleteOpenChatMessages();
+
+    console.log("Delete pass finished.");
+    console.log(`Deleted: ${deleteResult.deleted}`);
+    console.log(`Failed/skipped delete attempts: ${deleteResult.failed}`);
+    console.log(`Total delete attempts: ${deleteResult.totalAttempts}`);
+
+    if (window.__redditSingleChatCleanupStop) {
+      console.warn("Stopped by user before hide step.");
+      return {
+        hidden: false,
+        stopped: true
+      };
+    }
+
+    if (!HIDE_AFTER_DELETE) {
+      console.log("Automatic hide disabled in Streamlit settings.");
+      return {
+        hidden: false,
+        stopped: false
+      };
+    }
+
+    console.log("Automatic hide is enabled. Hiding this chat now...");
+
+    const hidden = await hideCurrentChat();
+
+    if (hidden) {
+      console.log("Current chat was hidden.");
+      await waitUntilCurrentChatChangesOrCloses(chatIdentity);
+
+      return {
+        hidden: true,
+        stopped: false
+      };
+    }
+
     console.warn("Delete pass finished, but hiding failed. Try hiding manually from Gear -> Hide chat.");
+
+    return {
+      hidden: false,
+      stopped: false
+    };
+  };
+
+  console.log("Single-chat woodchipper started.");
+  console.log("Open one chat, let it delete/hide, then open the next chat.");
+  console.log(`Username: ${USERNAME}`);
+  console.log(`Max chats to process: ${MAX_CHATS_TO_PROCESS}`);
+  console.log(`Waiting up to ${WAIT_FOR_NEXT_CHAT_SECONDS}s for each next chat.`);
+  console.log("Stop anytime with: window.__redditSingleChatCleanupStop = true");
+
+  let processedCount = 0;
+  let lastProcessedIdentity = "";
+  let totalDeletedAcrossChats = 0;
+  let totalFailedAcrossChats = 0;
+  let totalHiddenAcrossChats = 0;
+
+  while (
+    !window.__redditSingleChatCleanupStop &&
+    processedCount < MAX_CHATS_TO_PROCESS
+  ) {
+    const nextChat = await waitForNextOpenChat(lastProcessedIdentity);
+
+    if (!nextChat) {
+      break;
+    }
+
+    processedCount++;
+
+    const beforeDeletedLineCount = 0;
+
+    const result = await processCurrentlyOpenChat(processedCount, nextChat.identity);
+
+    // Totals are logged per chat inside deleteOpenChatMessages. These counters track hides/processed.
+    if (result.hidden) totalHiddenAcrossChats++;
+
+    lastProcessedIdentity = nextChat.identity;
+
+    if (result.stopped) break;
+
+    console.log(`Woodchipper pass ${processedCount} finished.`);
+    console.log("Open another chat when ready, and the script will continue automatically.");
+    await sleep(1200);
   }
+
+  console.log("Woodchipper stopped.");
+  console.log(`Chats processed: ${processedCount}`);
+  console.log(`Chats hidden: ${totalHiddenAcrossChats}`);
+  console.log("To run again, paste the generated script again.");
 })();
 """
 
@@ -918,6 +1147,8 @@ if generate:
             .replace("__MAX_TOTAL_DELETE_ATTEMPTS__", str(int(max_total_attempts)))
             .replace("__MAX_NO_PROGRESS_ATTEMPTS__", str(int(max_no_progress_attempts)))
             .replace("__MAX_EMPTY_SCROLL_ROUNDS__", str(int(max_empty_scroll_rounds)))
+            .replace("__MAX_CHATS_TO_PROCESS__", str(int(max_chats_to_process)))
+            .replace("__WAIT_FOR_NEXT_CHAT_SECONDS__", str(int(wait_for_next_chat_seconds)))
             .replace("__HIDE_AFTER_DELETE__", "true" if hide_after_delete else "false")
             .strip()
         )
@@ -947,9 +1178,9 @@ if generate:
         st.download_button(
             label="Download generated script as .js",
             data=script,
-            file_name="reddit_single_open_chat_auto_delete_hide.js",
+            file_name="reddit_chat_woodchipper_auto_delete_hide.js",
             mime="text/javascript",
             use_container_width=True
         )
 else:
-    st.info("Enter your username and click the button to generate the single-chat auto script.")
+    st.info("Enter your username and click the button to generate the woodchipper script.")
