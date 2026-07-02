@@ -53,7 +53,7 @@ generate = st.button(
 )
 
 JS_TEMPLATE = r"""
-// Reddit Selected-Chat Own-Message Bulk Delete with Retry
+// Reddit Selected-Chat Own-Message Bulk Delete with Retry + Sidebar Recovery
 // Shows a checkbox picker first.
 // Deletes only YOUR sent messages in the selected chats.
 // Retries failed visible messages until they disappear or the safety limit is reached.
@@ -61,6 +61,9 @@ JS_TEMPLATE = r"""
 // Does NOT delete posts.
 // Works on Reddit chat pages even if the URL is not exactly /chat.
 // Run on any Reddit chat page where the left chat sidebar is visible.
+//
+// Tip: If Reddit hides the sidebar after opening a chat, this version tries Back/history.back()
+// before moving to the next selected chat.
 
 (async () => {
   const USERNAME = __USERNAME_JSON__;
@@ -75,6 +78,7 @@ JS_TEMPLATE = r"""
   const CONFIRM_DELAY_MS = 150;
   const SCROLL_DELAY_MS = 600;
   const CHAT_SWITCH_DELAY_MS = 1800;
+  const SIDEBAR_RECOVERY_DELAY_MS = 1400;
   const GONE_CHECK_TIMEOUT_MS = 2500;
   const GONE_CHECK_INTERVAL_MS = 150;
 
@@ -526,7 +530,72 @@ JS_TEMPLATE = r"""
     return unique;
   };
 
-  const findChatElementByKey = (key, fallbackText = "") => {
+  const tryClickBackButton = async () => {
+    const possibleBackButtons = deepQueryAll(
+      [
+        'button[aria-label*="back" i]',
+        '[role="button"][aria-label*="back" i]',
+        'button[title*="back" i]',
+        '[aria-label="Back"]',
+        '[title="Back"]',
+        'rs-icon-button[icon="back"]',
+        'rs-icon-button[name="back"]'
+      ].join(",")
+    ).filter(isVisible);
+
+    if (possibleBackButtons.length === 0) {
+      return false;
+    }
+
+    possibleBackButtons[0].click();
+    await sleep(SIDEBAR_RECOVERY_DELAY_MS);
+
+    return getChatCandidates().length > 0;
+  };
+
+  const tryHistoryBack = async () => {
+    try {
+      history.back();
+      await sleep(SIDEBAR_RECOVERY_DELAY_MS);
+      return getChatCandidates().length > 0;
+    } catch {
+      return false;
+    }
+  };
+
+  const returnToChatListIfNeeded = async () => {
+    let chats = getChatCandidates();
+
+    if (chats.length > 0) {
+      return true;
+    }
+
+    console.warn("Chat list is not visible. Trying to return to the chat list...");
+
+    const clickedBack = await tryClickBackButton();
+
+    if (clickedBack) {
+      console.log("Returned to chat list using a visible Back button.");
+      return true;
+    }
+
+    const historyWorked = await tryHistoryBack();
+
+    if (historyWorked) {
+      console.log("Returned to chat list using browser history.");
+      return true;
+    }
+
+    console.warn(
+      "Still cannot see the chat list. Widen the Reddit window or undock DevTools, then run again."
+    );
+
+    return false;
+  };
+
+  const findChatElementByKey = async (key, fallbackText = "") => {
+    await returnToChatListIfNeeded();
+
     const candidates = getChatCandidates();
 
     let match = candidates.find((chat) => chat.key === key);
@@ -553,7 +622,7 @@ JS_TEMPLATE = r"""
   };
 
   const clickChatByKey = async (key, fallbackText) => {
-    const chatEl = findChatElementByKey(key, fallbackText);
+    const chatEl = await findChatElementByKey(key, fallbackText);
 
     if (!chatEl) {
       console.warn(`Could not find chat again: ${fallbackText || key}`);
@@ -565,20 +634,8 @@ JS_TEMPLATE = r"""
 
     console.log(`Opening selected chat: ${fallbackText || key}`);
 
-    const link = localQuery(chatEl, "a");
-
-    const href =
-      chatEl.href ||
-      chatEl.getAttribute("href") ||
-      link?.href ||
-      link?.getAttribute("href") ||
-      "";
-
-    if (href) {
-      location.href = href;
-    } else {
-      chatEl.click();
-    }
+    // Use a real click instead of location.href. This helps keep Reddit's sidebar layout alive.
+    chatEl.click();
 
     await sleep(CHAT_SWITCH_DELAY_MS);
 
@@ -590,7 +647,7 @@ JS_TEMPLATE = r"""
 
     if (chats.length === 0) {
       alert(
-        "No chats found. Make sure you are on a Reddit chat page and the left chat sidebar is visible. Try scrolling the sidebar, then run the script again."
+        "No chats found. Make sure you are on a Reddit chat page and the left chat sidebar is visible. Try widening the window, undocking DevTools, or scrolling the sidebar, then run the script again."
       );
       return [];
     }
@@ -630,7 +687,7 @@ JS_TEMPLATE = r"""
 
         <p style="margin:0 0 12px;font-size:13px;line-height:1.4;color:#555;">
           If a chat is missing, cancel this popup, scroll the left Reddit chat sidebar to load more chats,
-          then run the script again.
+          then run the script again. If the script only processes one chat, undock DevTools or widen the Reddit window.
         </p>
 
         <div style="display:flex;gap:8px;margin-bottom:12px;">
@@ -717,6 +774,7 @@ JS_TEMPLATE = r"""
   console.log("Current URL:", location.href);
   console.log("Tip: the URL does not need to be exactly /chat.");
   console.log("Tip: scroll the left chat sidebar before running if you want more chats to appear.");
+  console.log("Tip: if only one chat processes, undock DevTools or widen the Reddit window.");
   console.log(`Retry settings: ${MAX_RETRY_ROUNDS_PER_CHAT} retry rounds per chat, stop after ${MAX_NO_PROGRESS_ROUNDS} no-progress rounds.`);
 
   const selectedChats = await showChatPicker();
@@ -753,6 +811,9 @@ JS_TEMPLATE = r"""
     console.log(
       `Finished chat: ${chat.text}. Deleted: ${result.deleted}. Failed/skipped attempts: ${result.failed}.`
     );
+
+    // After each chat, try to restore the chat list before the next loop.
+    await returnToChatListIfNeeded();
   }
 
   console.log("Selected-chat cleanup finished.");
@@ -788,14 +849,15 @@ if generate:
             1. Open Reddit Chat.
             2. It is okay if Reddit redirects you to a specific chat/channel URL.
             3. Make sure the left chat sidebar is visible.
-            4. Scroll the left chat sidebar until the chats you want are loaded.
-            5. Open DevTools.
-            6. Go to the **Console** tab.
-            7. Paste the generated script.
-            8. Select the chats in the popup.
-            9. Click **Delete selected chats**.
+            4. For best results, undock DevTools or make the Reddit window wide.
+            5. Scroll the left chat sidebar until the chats you want are loaded.
+            6. Open DevTools.
+            7. Go to the **Console** tab.
+            8. Paste the generated script.
+            9. Select the chats in the popup.
+            10. Click **Delete selected chats**.
 
-            The script will retry visible failed messages until they disappear or until the safety stop is reached.
+            This version tries to recover the sidebar after each chat before moving to the next one.
             """
         )
 
@@ -804,7 +866,7 @@ if generate:
         st.download_button(
             label="Download script as .js",
             data=script,
-            file_name="reddit_selected_chat_retry_delete.js",
+            file_name="reddit_selected_chat_retry_delete_sidebar_recovery.js",
             mime="text/javascript",
             use_container_width=True
         )
