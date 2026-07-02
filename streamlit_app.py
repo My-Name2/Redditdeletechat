@@ -65,7 +65,7 @@ JS_TEMPLATE = r"""
 // Retries failed visible messages until they disappear or the safety limit is reached.
 // Hides chats by clicking the top-right gear, then Hide chat, then Yes, Hide.
 // Handles [deleted] chat rows if Reddit shows them in the sidebar.
-// Deduplicates nested sidebar rows so each chat should appear once.
+// Uses visual sidebar scanning to catch more visible chats.
 // Does NOT delete comments.
 // Does NOT delete posts.
 // Run on any Reddit chat page where the left chat sidebar is visible.
@@ -92,6 +92,10 @@ JS_TEMPLATE = r"""
 
   const escapeRegExp = (value) =>
     value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+  const sidebarRight = () => {
+    return Math.min(390, Math.max(260, window.innerWidth * 0.38));
+  };
 
   const deepNodes = function* (root = document) {
     yield root;
@@ -225,6 +229,292 @@ JS_TEMPLATE = r"""
         const text = cleanText(getReadableText(el));
         return regex.test(text);
       });
+  };
+
+  const isBadSidebarText = (text) => {
+    return /create|settings|logout|advertise|premium|popular|home|all|notifications|explore|search|close|back|help|privacy|terms|reddit recap|communities|custom feeds|threads$|select reddit chats|delete\/hide selected chats|hide after cleaning|select all|select none/i.test(
+      text
+    );
+  };
+
+  const looksLikeSidebarChatText = (text) => {
+    const cleaned = cleanText(text);
+
+    if (!cleaned || cleaned.length < 2) return false;
+    if (isBadSidebarText(cleaned)) return false;
+
+    return (
+      cleaned.includes("You:") ||
+      cleaned.includes("[deleted]") ||
+      /yesterday|today|jun|jul|aug|sep|oct|nov|dec|jan|feb|mar|apr|may|\d{1,2}:\d{2}\s?(am|pm)?/i.test(cleaned) ||
+      /^[a-z0-9_.-]{3,40}$/i.test(cleaned)
+    );
+  };
+
+  const isSidebarRowRect = (r) => {
+    return (
+      r.left >= 0 &&
+      r.left < sidebarRight() &&
+      r.width >= 90 &&
+      r.width <= sidebarRight() + 80 &&
+      r.height >= 24 &&
+      r.height <= 145 &&
+      r.top > 80 &&
+      r.bottom < window.innerHeight + 20
+    );
+  };
+
+  const getParentElementAcrossShadow = (el) => {
+    if (!el) return null;
+
+    if (el.parentElement) return el.parentElement;
+
+    const root = el.getRootNode?.();
+
+    if (root && root.host) return root.host;
+
+    return null;
+  };
+
+  const scorePossibleChatRow = (el) => {
+    if (!el || !isVisible(el)) return -Infinity;
+
+    const r = el.getBoundingClientRect();
+    const text = cleanText(getReadableText(el));
+
+    if (!isSidebarRowRect(r)) return -Infinity;
+    if (!looksLikeSidebarChatText(text)) return -Infinity;
+
+    let score = 0;
+
+    score += Math.min(r.width, 340) * 3;
+    score += Math.min(r.height, 90) * 2;
+
+    if (getElementHref(el)) score += 200;
+    if (text.includes("[deleted]")) score += 160;
+    if (text.includes("You:")) score += 120;
+    if (/yesterday|today|jun|jul|aug|sep|oct|nov|dec|jan|feb|mar|apr|may|\d{1,2}:\d{2}\s?(am|pm)?/i.test(text)) score += 80;
+
+    const tag = el.tagName?.toLowerCase() || "";
+    const role = el.getAttribute?.("role") || "";
+
+    if (tag === "button" || tag === "a") score += 80;
+    if (role === "button" || role === "link" || role === "listitem" || role === "option") score += 80;
+
+    if (text.length > 260) score -= 150;
+    if (r.height > 120) score -= 80;
+
+    return score;
+  };
+
+  const bestSidebarRowFromElement = (startEl) => {
+    let el = startEl;
+    let best = null;
+    let bestScore = -Infinity;
+    let depth = 0;
+
+    while (el && el !== document.body && depth < 12) {
+      const score = scorePossibleChatRow(el);
+
+      if (score > bestScore) {
+        best = el;
+        bestScore = score;
+      }
+
+      el = getParentElementAcrossShadow(el);
+      depth++;
+    }
+
+    return bestScore > -Infinity ? best : null;
+  };
+
+  const scanSidebarRowsByScreenPosition = () => {
+    const found = [];
+    const seen = new Set();
+
+    const maxX = Math.min(sidebarRight() - 15, 340);
+    const sampleXs = [28, 55, 90, 135, 185, 235, 275, 320]
+      .filter((x) => x > 0 && x < maxX);
+
+    for (let y = 90; y < window.innerHeight - 8; y += 8) {
+      for (const x of sampleXs) {
+        const pointEl = document.elementFromPoint(x, y);
+        if (!pointEl) continue;
+
+        const row = bestSidebarRowFromElement(pointEl);
+        if (!row) continue;
+
+        const r = row.getBoundingClientRect();
+        const text = cleanText(getReadableText(row));
+
+        const key = `${Math.round(r.top)}:${Math.round(r.left)}:${Math.round(r.width)}:${Math.round(r.height)}:${text.slice(0, 60)}`;
+
+        if (seen.has(key)) continue;
+
+        seen.add(key);
+        found.push(row);
+      }
+    }
+
+    return found;
+  };
+
+  const scanSidebarRowsBySelectors = () => {
+    const selectors = [
+      'a[href*="chat"]',
+      'a[href*="channel"]',
+      'a[href*="room"]',
+      '[role="link"]',
+      '[role="listitem"]',
+      '[role="option"]',
+      'rs-list-item',
+      'rs-room-list-item',
+      'rs-conversation-list-item',
+      'button',
+      'a',
+      'div'
+    ].join(",");
+
+    return deepQueryAll(selectors)
+      .filter(isVisible)
+      .map((el) => bestSidebarRowFromElement(el))
+      .filter(Boolean);
+  };
+
+  const groupRowsByVisualPosition = (rawRows) => {
+    const sorted = [...new Set(rawRows)]
+      .filter(isVisible)
+      .sort((a, b) => {
+        const ar = a.getBoundingClientRect();
+        const br = b.getBoundingClientRect();
+
+        if (Math.abs(ar.top - br.top) > 8) return ar.top - br.top;
+        return ar.left - br.left;
+      });
+
+    const groups = [];
+
+    for (const el of sorted) {
+      const r = el.getBoundingClientRect();
+      const text = cleanText(getReadableText(el));
+      const centerY = r.top + r.height / 2;
+
+      const existingGroup = groups.find((group) => {
+        const overlapTop = Math.max(group.top, r.top);
+        const overlapBottom = Math.min(group.bottom, r.bottom);
+        const overlap = Math.max(0, overlapBottom - overlapTop);
+        const smallerHeight = Math.min(group.bottom - group.top, r.height);
+
+        const overlapsSameRow =
+          smallerHeight > 0 && overlap / smallerHeight > 0.35;
+
+        const closeCenter = Math.abs(group.centerY - centerY) < 28;
+
+        return overlapsSameRow || closeCenter;
+      });
+
+      const candidate = {
+        el,
+        rect: r,
+        text,
+        centerY,
+        score: scorePossibleChatRow(el)
+      };
+
+      if (existingGroup) {
+        existingGroup.items.push(candidate);
+        existingGroup.top = Math.min(existingGroup.top, r.top);
+        existingGroup.bottom = Math.max(existingGroup.bottom, r.bottom);
+        existingGroup.centerY = (existingGroup.top + existingGroup.bottom) / 2;
+      } else {
+        groups.push({
+          top: r.top,
+          bottom: r.bottom,
+          centerY,
+          items: [candidate]
+        });
+      }
+    }
+
+    return groups.map((group) => {
+      return group.items.sort((a, b) => b.score - a.score)[0];
+    });
+  };
+
+  const getChatCandidates = () => {
+    const pointRows = scanSidebarRowsByScreenPosition();
+    const selectorRows = scanSidebarRowsBySelectors();
+
+    const bestRows = groupRowsByVisualPosition([
+      ...pointRows,
+      ...selectorRows
+    ]);
+
+    const unique = [];
+    const seenKeys = new Set();
+    const duplicateCounter = new Map();
+
+    for (const item of bestRows) {
+      const el = item.el;
+      const r = item.rect;
+
+      const href = getElementHref(el);
+      const text = cleanText(getReadableText(el)).slice(0, 240);
+      const normalizedText = normalizeTextForMatch(text);
+
+      if (!text || text.length < 2) continue;
+      if (isBadSidebarText(text)) continue;
+
+      const currentDupIndex = duplicateCounter.get(normalizedText) || 0;
+      duplicateCounter.set(normalizedText, currentDupIndex + 1);
+
+      const geometryKey = `${Math.round(r.top)}:${Math.round(r.left)}:${Math.round(r.width)}:${Math.round(r.height)}`;
+      const baseKey = href || normalizedText || text;
+      const key = href || `${baseKey}::row${unique.length}::${geometryKey}`;
+
+      if (seenKeys.has(key)) continue;
+      seenKeys.add(key);
+
+      let displayText = text || href || "[unknown chat]";
+
+      if (
+        normalizedText.includes("[deleted]") ||
+        displayText.toLowerCase().includes("[deleted]")
+      ) {
+        displayText = `[deleted chat] ${displayText}`;
+      }
+
+      unique.push({
+        key,
+        text: displayText,
+        rawText: text,
+        normalizedText,
+        duplicateIndex: currentDupIndex,
+        href,
+        top: Math.round(r.top),
+        left: Math.round(r.left),
+        width: Math.round(r.width),
+        height: Math.round(r.height),
+        element: el
+      });
+    }
+
+    console.log(
+      "Detected chat candidates:",
+      unique.map((chat, i) => ({
+        number: i + 1,
+        text: chat.text,
+        rawText: chat.rawText,
+        href: chat.href,
+        duplicateIndex: chat.duplicateIndex,
+        top: chat.top,
+        left: chat.left,
+        width: chat.width,
+        height: chat.height
+      }))
+    );
+
+    return unique;
   };
 
   const isOwnMessage = (eventEl) => {
@@ -371,7 +661,7 @@ JS_TEMPLATE = r"""
 
         return (
           isVisible(el) &&
-          r.left > window.innerWidth * 0.25 &&
+          r.left > sidebarRight() &&
           el.scrollHeight > el.clientHeight + 50 &&
           ["auto", "scroll"].includes(s.overflowY)
         );
@@ -472,184 +762,6 @@ JS_TEMPLATE = r"""
     return { deleted, failed };
   };
 
-  const getChatCandidates = () => {
-    const selectors = [
-      'a[href*="chat"]',
-      'a[href*="channel"]',
-      'a[href*="room"]',
-      '[role="link"]',
-      '[role="listitem"]',
-      '[role="option"]',
-      'rs-list-item',
-      'rs-room-list-item',
-      'rs-conversation-list-item',
-      'button',
-      'a',
-      'div'
-    ].join(",");
-
-    const raw = deepQueryAll(selectors)
-      .filter(isVisible)
-      .filter((el) => {
-        const r = el.getBoundingClientRect();
-        const text = cleanText(getReadableText(el));
-
-        if (!text || text.length < 2) return false;
-
-        const inLeftSidebar =
-          r.left >= 0 &&
-          r.left < window.innerWidth * 0.36 &&
-          r.width >= 120 &&
-          r.width <= 360 &&
-          r.height >= 24 &&
-          r.height <= 130;
-
-        const notTopNav = r.top > 85;
-
-        const looksLikeChatRow =
-          text.includes("You:") ||
-          text.includes("[deleted]") ||
-          /yesterday|today|jun|jul|aug|sep|oct|nov|dec|jan|feb|mar|apr|may|\d{1,2}:\d{2}\s?(am|pm)?/i.test(text);
-
-        const notObviousBadItem =
-          !/create|settings|logout|advertise|premium|popular|home|all|notifications|explore|search|close|back|help|privacy|terms|reddit recap|communities|custom feeds|threads$/i.test(
-            text
-          );
-
-        return (
-          inLeftSidebar &&
-          notTopNav &&
-          looksLikeChatRow &&
-          notObviousBadItem
-        );
-      });
-
-    const sorted = raw.sort((a, b) => {
-      const ar = a.getBoundingClientRect();
-      const br = b.getBoundingClientRect();
-
-      if (Math.abs(ar.top - br.top) > 8) return ar.top - br.top;
-      return ar.left - br.left;
-    });
-
-    const rowGroups = [];
-
-    for (const el of sorted) {
-      const r = el.getBoundingClientRect();
-      const text = cleanText(getReadableText(el));
-      const centerY = r.top + r.height / 2;
-
-      const existingGroup = rowGroups.find((group) => {
-        const groupCenter = group.centerY;
-        const groupTop = group.top;
-        const groupBottom = group.bottom;
-
-        const overlapTop = Math.max(groupTop, r.top);
-        const overlapBottom = Math.min(groupBottom, r.bottom);
-        const overlap = Math.max(0, overlapBottom - overlapTop);
-        const smallerHeight = Math.min(groupBottom - groupTop, r.height);
-
-        const overlapsSameRow =
-          smallerHeight > 0 && overlap / smallerHeight > 0.45;
-
-        const closeCenter = Math.abs(groupCenter - centerY) < 30;
-
-        return overlapsSameRow || closeCenter;
-      });
-
-      const candidate = {
-        el,
-        rect: r,
-        text,
-        centerY,
-        score:
-          r.width +
-          r.height +
-          (getElementHref(el) ? 100 : 0) +
-          (text.includes("[deleted]") ? 50 : 0) +
-          (text.includes("You:") ? 25 : 0)
-      };
-
-      if (existingGroup) {
-        existingGroup.items.push(candidate);
-        existingGroup.top = Math.min(existingGroup.top, r.top);
-        existingGroup.bottom = Math.max(existingGroup.bottom, r.bottom);
-        existingGroup.centerY = (existingGroup.top + existingGroup.bottom) / 2;
-      } else {
-        rowGroups.push({
-          top: r.top,
-          bottom: r.bottom,
-          centerY,
-          items: [candidate]
-        });
-      }
-    }
-
-    const bestRows = rowGroups.map((group) => {
-      return group.items.sort((a, b) => b.score - a.score)[0];
-    });
-
-    const unique = [];
-    const duplicateCounter = new Map();
-
-    for (const item of bestRows) {
-      const el = item.el;
-      const r = item.rect;
-
-      const href = getElementHref(el);
-      const text = cleanText(getReadableText(el)).slice(0, 220);
-      const normalizedText = normalizeTextForMatch(text);
-
-      if (!text || text.length < 2) continue;
-
-      const currentDupIndex = duplicateCounter.get(normalizedText) || 0;
-      duplicateCounter.set(normalizedText, currentDupIndex + 1);
-
-      const geometryKey = `${Math.round(r.top)}:${Math.round(r.left)}:${Math.round(r.width)}:${Math.round(r.height)}`;
-      const key = href || `${normalizedText || text}::row${unique.length}::${geometryKey}`;
-
-      let displayText = text || href || "[unknown chat]";
-
-      if (
-        normalizedText.includes("[deleted]") ||
-        displayText.toLowerCase().includes("[deleted]")
-      ) {
-        displayText = `[deleted chat] ${displayText}`;
-      }
-
-      unique.push({
-        key,
-        text: displayText,
-        rawText: text,
-        normalizedText,
-        duplicateIndex: currentDupIndex,
-        href,
-        top: Math.round(r.top),
-        left: Math.round(r.left),
-        width: Math.round(r.width),
-        height: Math.round(r.height),
-        element: el
-      });
-    }
-
-    console.log(
-      "Detected chat candidates:",
-      unique.map((chat, i) => ({
-        number: i + 1,
-        text: chat.text,
-        rawText: chat.rawText,
-        href: chat.href,
-        duplicateIndex: chat.duplicateIndex,
-        top: chat.top,
-        left: chat.left,
-        width: chat.width,
-        height: chat.height
-      }))
-    );
-
-    return unique;
-  };
-
   const tryClickBackButton = async () => {
     const possibleBackButtons = deepQueryAll(
       [
@@ -726,15 +838,6 @@ JS_TEMPLATE = r"""
 
     if (!match && savedChat.key) {
       match = candidates.find((chat) => chat.key === savedChat.key);
-    }
-
-    if (!match && savedChat.normalizedText) {
-      match = candidates.find((chat) => {
-        return (
-          chat.normalizedText === savedChat.normalizedText &&
-          chat.duplicateIndex === savedChat.duplicateIndex
-        );
-      });
     }
 
     if (!match && savedChat.rawText) {
@@ -906,8 +1009,8 @@ JS_TEMPLATE = r"""
         return (
           r.top >= 0 &&
           r.top < 80 &&
-          r.left > window.innerWidth * 0.45 &&
-          r.right > window.innerWidth - 140 &&
+          r.left > sidebarRight() &&
+          r.right > window.innerWidth - 160 &&
           r.width >= 16 &&
           r.height >= 16
         );
@@ -1010,7 +1113,7 @@ JS_TEMPLATE = r"""
       overlay.style.fontFamily = "Arial, sans-serif";
 
       const panel = document.createElement("div");
-      panel.style.width = "min(780px, 92vw)";
+      panel.style.width = "min(820px, 92vw)";
       panel.style.maxHeight = "82vh";
       panel.style.overflow = "auto";
       panel.style.background = "#fff";
@@ -1027,9 +1130,9 @@ JS_TEMPLATE = r"""
         </p>
 
         <p style="margin:0 0 12px;font-size:13px;line-height:1.4;color:#555;">
-          [deleted] chats are included if Reddit shows them in the sidebar. If a chat is missing,
-          cancel this popup, scroll the left Reddit chat sidebar to load more chats, then run the script again.
-          If the script only processes one chat, undock DevTools or widen the Reddit window.
+          This version scans the visible left sidebar by screen position, so it should catch normal chats,
+          [deleted] chats, and rows with no preview text. If a chat is missing, cancel this popup, scroll the left
+          Reddit chat sidebar to load more chats, then run the script again.
         </p>
 
         <p style="margin:0 0 12px;font-size:13px;line-height:1.4;color:#555;">
@@ -1122,7 +1225,7 @@ JS_TEMPLATE = r"""
 
   console.log("Scanning visible chats...");
   console.log("Current URL:", location.href);
-  console.log("Tip: the URL does not need to be exactly /chat.");
+  console.log("Tip: this version scans the visible sidebar by screen position.");
   console.log("Tip: [deleted] chat rows are included if Reddit renders them in the sidebar.");
   console.log("Tip: scroll the left chat sidebar before running if you want more chats to appear.");
   console.log("Tip: if only one chat processes, undock DevTools or widen the Reddit window.");
@@ -1231,7 +1334,7 @@ if generate:
             9. Select the chats in the popup.
             10. Click **Delete/hide selected chats**.
 
-            This version deduplicates nested sidebar rows, so each visible chat should appear once.
+            This version scans the visible sidebar by screen position, so it should catch more visible chats, including `[deleted]` rows.
             """
         )
 
@@ -1240,7 +1343,7 @@ if generate:
         st.download_button(
             label="Download script as .js",
             data=script,
-            file_name="reddit_selected_chat_delete_hide_deduped.js",
+            file_name="reddit_selected_chat_delete_hide_visual_scan.js",
             mime="text/javascript",
             use_container_width=True
         )
