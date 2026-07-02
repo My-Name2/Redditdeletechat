@@ -12,7 +12,7 @@ st.caption("Generate a selected-chat delete script, then paste it into Reddit's 
 
 st.warning(
     "Hosted Streamlit apps cannot directly control reddit.com in your browser. "
-    "This app generates JavaScript that you paste into the Console on reddit.com/chat."
+    "This app generates JavaScript that you paste into the Console on a Reddit chat page."
 )
 
 username = st.text_input(
@@ -40,7 +40,8 @@ JS_TEMPLATE = r"""
 // Deletes only YOUR sent messages in the selected chats.
 // Does NOT delete comments.
 // Does NOT delete posts.
-// Run on https://www.reddit.com/chat with the left chat sidebar visible.
+// Works on Reddit chat pages even if the URL is not exactly /chat.
+// Run on any Reddit chat page where the left chat sidebar is visible.
 
 (async () => {
   const USERNAME = __USERNAME_JSON__;
@@ -150,8 +151,17 @@ JS_TEMPLATE = r"""
   };
 
   const getChatKey = (el) => {
-    const href = el.href || el.getAttribute("href") || "";
-    const text = cleanText(getReadableText(el)).slice(0, 160);
+    const link = localQuery(el, "a");
+
+    const href =
+      el.href ||
+      el.getAttribute("href") ||
+      link?.href ||
+      link?.getAttribute("href") ||
+      "";
+
+    const text = cleanText(getReadableText(el)).slice(0, 180);
+
     return href || text;
   };
 
@@ -346,15 +356,21 @@ JS_TEMPLATE = r"""
   };
 
   const getChatCandidates = () => {
-    const candidates = deepQueryAll(
-      [
-        'a[href*="/chat/"]',
-        '[role="link"][href*="/chat/"]',
-        '[role="listitem"]',
-        'rs-list-item',
-        'button'
-      ].join(",")
-    )
+    const selectors = [
+      'a[href*="chat"]',
+      'a[href*="channel"]',
+      'a[href*="room"]',
+      '[role="link"]',
+      '[role="listitem"]',
+      '[role="option"]',
+      'rs-list-item',
+      'rs-room-list-item',
+      'rs-conversation-list-item',
+      'button',
+      'a'
+    ].join(",");
+
+    const raw = deepQueryAll(selectors)
       .filter(isVisible)
       .filter((el) => {
         const r = el.getBoundingClientRect();
@@ -363,15 +379,17 @@ JS_TEMPLATE = r"""
         if (!text || text.length < 2) return false;
 
         const inLeftSidebar =
-          r.left < window.innerWidth * 0.45 &&
-          r.width > 120 &&
-          r.height >= 28 &&
-          r.height <= 130;
+          r.left >= 0 &&
+          r.left < window.innerWidth * 0.5 &&
+          r.width >= 90 &&
+          r.width <= window.innerWidth * 0.6 &&
+          r.height >= 24 &&
+          r.height <= 170;
 
-        const notTopNav = r.top > 70;
+        const notTopNav = r.top > 55;
 
         const notObviousBadItem =
-          !/create|settings|logout|advertise|premium|popular|home|all|messages|notifications/i.test(
+          !/create|settings|logout|advertise|premium|popular|home|all|notifications|explore|search|close|back|help|privacy|terms|reddit recap|communities|custom feeds/i.test(
             text
           );
 
@@ -381,9 +399,20 @@ JS_TEMPLATE = r"""
     const unique = [];
     const seen = new Set();
 
-    for (const el of candidates) {
-      const key = getChatKey(el);
-      const text = cleanText(getReadableText(el)).slice(0, 160);
+    for (const el of raw) {
+      const r = el.getBoundingClientRect();
+
+      const link = localQuery(el, "a");
+
+      const href =
+        el.href ||
+        el.getAttribute("href") ||
+        link?.href ||
+        link?.getAttribute("href") ||
+        "";
+
+      const text = cleanText(getReadableText(el)).slice(0, 180);
+      const key = href || text;
 
       if (!key || seen.has(key)) continue;
 
@@ -392,18 +421,49 @@ JS_TEMPLATE = r"""
       unique.push({
         key,
         text: text || key,
-        href: el.href || el.getAttribute("href") || "",
+        href,
+        top: Math.round(r.top),
+        left: Math.round(r.left),
+        width: Math.round(r.width),
+        height: Math.round(r.height),
         element: el
       });
     }
 
+    console.log(
+      "Detected chat candidates:",
+      unique.map((chat, i) => ({
+        number: i + 1,
+        text: chat.text,
+        href: chat.href,
+        top: chat.top,
+        left: chat.left,
+        width: chat.width,
+        height: chat.height
+      }))
+    );
+
     return unique;
   };
 
-  const findChatElementByKey = (key) => {
+  const findChatElementByKey = (key, fallbackText = "") => {
     const candidates = getChatCandidates();
 
-    const match = candidates.find((chat) => chat.key === key);
+    let match = candidates.find((chat) => chat.key === key);
+
+    if (!match && fallbackText) {
+      const cleanedFallback = cleanText(fallbackText).toLowerCase();
+
+      match = candidates.find((chat) => {
+        const cleanedCandidate = cleanText(chat.text).toLowerCase();
+
+        return (
+          cleanedCandidate === cleanedFallback ||
+          cleanedCandidate.includes(cleanedFallback) ||
+          cleanedFallback.includes(cleanedCandidate)
+        );
+      });
+    }
 
     if (match && match.element && isVisible(match.element)) {
       return match.element;
@@ -413,7 +473,7 @@ JS_TEMPLATE = r"""
   };
 
   const clickChatByKey = async (key, fallbackText) => {
-    const chatEl = findChatElementByKey(key);
+    const chatEl = findChatElementByKey(key, fallbackText);
 
     if (!chatEl) {
       console.warn(`Could not find chat again: ${fallbackText || key}`);
@@ -425,7 +485,21 @@ JS_TEMPLATE = r"""
 
     console.log(`Opening selected chat: ${fallbackText || key}`);
 
-    chatEl.click();
+    const link = localQuery(chatEl, "a");
+
+    const href =
+      chatEl.href ||
+      chatEl.getAttribute("href") ||
+      link?.href ||
+      link?.getAttribute("href") ||
+      "";
+
+    if (href) {
+      location.href = href;
+    } else {
+      chatEl.click();
+    }
+
     await sleep(CHAT_SWITCH_DELAY_MS);
 
     return true;
@@ -436,7 +510,7 @@ JS_TEMPLATE = r"""
 
     if (chats.length === 0) {
       alert(
-        "No chats found. Make sure you are on reddit.com/chat and the left chat sidebar is visible."
+        "No chats found. Make sure you are on a Reddit chat page and the left chat sidebar is visible. Try scrolling the sidebar, then run the script again."
       );
       return [];
     }
@@ -458,7 +532,7 @@ JS_TEMPLATE = r"""
       overlay.style.fontFamily = "Arial, sans-serif";
 
       const panel = document.createElement("div");
-      panel.style.width = "min(720px, 92vw)";
+      panel.style.width = "min(760px, 92vw)";
       panel.style.maxHeight = "82vh";
       panel.style.overflow = "auto";
       panel.style.background = "#fff";
@@ -472,6 +546,11 @@ JS_TEMPLATE = r"""
         <p style="margin:0 0 12px;font-size:14px;line-height:1.4;">
           Found ${chats.length} visible chat item(s). Select the chats you want to process.
           This will delete only messages sent by <b>${USERNAME}</b>.
+        </p>
+
+        <p style="margin:0 0 12px;font-size:13px;line-height:1.4;color:#555;">
+          If a chat is missing, cancel this popup, scroll the left Reddit chat sidebar to load more chats,
+          then run the script again.
         </p>
 
         <div style="display:flex;gap:8px;margin-bottom:12px;">
@@ -555,6 +634,8 @@ JS_TEMPLATE = r"""
   };
 
   console.log("Scanning visible chats...");
+  console.log("Current URL:", location.href);
+  console.log("Tip: the URL does not need to be exactly /chat.");
   console.log("Tip: scroll the left chat sidebar before running if you want more chats to appear.");
 
   const selectedChats = await showChatPicker();
@@ -621,13 +702,15 @@ if generate:
             """
             **How to use it:**
 
-            1. Open `https://www.reddit.com/chat`.
-            2. Scroll the left chat sidebar until the chats you want are loaded.
-            3. Open DevTools.
-            4. Go to the **Console** tab.
-            5. Paste the generated script.
-            6. Select the chats in the popup.
-            7. Click **Delete selected chats**.
+            1. Open Reddit Chat.
+            2. It is okay if Reddit redirects you to a specific chat/channel URL.
+            3. Make sure the left chat sidebar is visible.
+            4. Scroll the left chat sidebar until the chats you want are loaded.
+            5. Open DevTools.
+            6. Go to the **Console** tab.
+            7. Paste the generated script.
+            8. Select the chats in the popup.
+            9. Click **Delete selected chats**.
             """
         )
 
