@@ -1,3 +1,40 @@
+import json
+import streamlit as st
+
+st.set_page_config(
+    page_title="Reddit Chat Delete Script Generator",
+    page_icon="🧹",
+    layout="centered"
+)
+
+st.title("Reddit Chat Delete Script Generator")
+st.caption("Generate a selected-chat delete script, then paste it into Reddit's DevTools Console.")
+
+st.warning(
+    "Hosted Streamlit apps cannot directly control reddit.com in your browser. "
+    "This app generates JavaScript that you paste into the Console on reddit.com/chat."
+)
+
+username = st.text_input(
+    "Reddit username",
+    placeholder="without u/"
+)
+
+speed = st.slider(
+    "Max deletes per minute",
+    min_value=20,
+    max_value=150,
+    value=80,
+    step=10
+)
+
+generate = st.button(
+    "Generate selected-chat delete script",
+    type="primary",
+    use_container_width=True
+)
+
+JS_TEMPLATE = r"""
 // Reddit Selected-Chat Own-Message Bulk Delete
 // Shows a checkbox picker first.
 // Deletes only YOUR sent messages in the selected chats.
@@ -6,12 +43,8 @@
 // Run on https://www.reddit.com/chat with the left chat sidebar visible.
 
 (async () => {
-  const USERNAME = prompt("Enter your exact Reddit username, without u/:");
-  if (!USERNAME) return console.log("Cancelled: username required.");
-
-  const MAX_DELETES_PER_MINUTE = Number(
-    prompt("Max deletes per minute? Try 60-100.", "80")
-  ) || 80;
+  const USERNAME = __USERNAME_JSON__;
+  const MAX_DELETES_PER_MINUTE = __MAX_DELETES__;
 
   const DELETE_DELAY_MS = Math.ceil(60000 / MAX_DELETES_PER_MINUTE);
   const SHORT_DELAY_MS = 100;
@@ -355,6 +388,7 @@
       if (!key || seen.has(key)) continue;
 
       seen.add(key);
+
       unique.push({
         key,
         text: text || key,
@@ -379,7 +413,7 @@
   };
 
   const clickChatByKey = async (key, fallbackText) => {
-    let chatEl = findChatElementByKey(key);
+    const chatEl = findChatElementByKey(key);
 
     if (!chatEl) {
       console.warn(`Could not find chat again: ${fallbackText || key}`);
@@ -568,3 +602,43 @@
     console.log("If many messages failed, run again with a slower speed like 60.");
   }
 })();
+"""
+
+if generate:
+    if not username.strip():
+        st.error("Enter your Reddit username first.")
+    else:
+        script = (
+            JS_TEMPLATE
+            .replace("__USERNAME_JSON__", json.dumps(username.strip()))
+            .replace("__MAX_DELETES__", str(int(speed)))
+            .strip()
+        )
+
+        st.success("Script generated.")
+
+        st.markdown(
+            """
+            **How to use it:**
+
+            1. Open `https://www.reddit.com/chat`.
+            2. Scroll the left chat sidebar until the chats you want are loaded.
+            3. Open DevTools.
+            4. Go to the **Console** tab.
+            5. Paste the generated script.
+            6. Select the chats in the popup.
+            7. Click **Delete selected chats**.
+            """
+        )
+
+        st.code(script, language="javascript")
+
+        st.download_button(
+            label="Download script as .js",
+            data=script,
+            file_name="reddit_selected_chat_delete.js",
+            mime="text/javascript",
+            use_container_width=True
+        )
+else:
+    st.info("Enter your Reddit username and click the button to generate the script.")
