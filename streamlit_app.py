@@ -767,20 +767,145 @@ JS_TEMPLATE = r"""
   };
 
   const clickConfirmHideIfNeeded = async () => {
-    if (!isHideChatModalOpen()) {
-      await sleep(400);
+    console.log("Waiting for Hide chat confirmation popup...");
+
+    const visibleTextDeep = () => {
+      try {
+        return normalizeText(
+          deepQueryAll(
+            [
+              "dialog",
+              "[role='dialog']",
+              "div",
+              "section",
+              "article",
+              "h1",
+              "h2",
+              "h3",
+              "p",
+              "span",
+              "button",
+              "[role='button']",
+              "rs-button"
+            ].join(",")
+          )
+            .filter(isVisible)
+            .map(getReadableText)
+            .filter(Boolean)
+            .join(" ")
+        );
+      } catch {
+        return "";
+      }
+    };
+
+    const hidePopupTextVisible = () => {
+      const bodyText = normalizeText(document.body.innerText);
+      const deepText = visibleTextDeep();
+      const combined = `${bodyText} ${deepText}`;
+
+      return (
+        combined.includes("hide chat?") ||
+        combined.includes("this conversation will be hidden") ||
+        combined.includes("yes, hide") ||
+        combined.includes("yes hide")
+      );
+    };
+
+    const yesHideButtonVisible = () => {
+      return deepQueryAll("button, [role='button'], rs-button")
+        .filter(isVisible)
+        .map((button) => {
+          const r = button.getBoundingClientRect();
+          const text = normalizeText(getReadableText(button));
+          let background = "";
+
+          try {
+            background = getComputedStyle(button).backgroundColor || "";
+          } catch {}
+
+          return {
+            button,
+            text,
+            r,
+            background
+          };
+        })
+        .filter((item) => {
+          return (
+            item.r.width >= 32 &&
+            item.r.height >= 22 &&
+            item.r.top > 120 &&
+            item.r.bottom < window.innerHeight &&
+            !/^x$|^close$|^cancel$/i.test(item.text)
+          );
+        })
+        .sort((a, b) => {
+          const aExact = /^yes,\s*hide$|^yes\s*hide$/i.test(a.text) ? 10000 : 0;
+          const bExact = /^yes,\s*hide$|^yes\s*hide$/i.test(b.text) ? 10000 : 0;
+
+          const aHide = /hide/i.test(a.text) ? 4000 : 0;
+          const bHide = /hide/i.test(b.text) ? 4000 : 0;
+
+          const aDark = /rgb\(0,\s*0,\s*0\)|rgba\(0,\s*0,\s*0/i.test(a.background) ? 1000 : 0;
+          const bDark = /rgb\(0,\s*0,\s*0\)|rgba\(0,\s*0,\s*0/i.test(b.background) ? 1000 : 0;
+
+          const aScore = aExact + aHide + aDark + a.r.right + a.r.bottom * 0.1;
+          const bScore = bExact + bHide + bDark + b.r.right + b.r.bottom * 0.1;
+
+          return bScore - aScore;
+        })[0]?.button || null;
+    };
+
+    const started = Date.now();
+    let sawPopup = false;
+    let clicked = false;
+
+    while (Date.now() - started < 10000) {
+      await sleep(250);
+
+      const popupVisible = hidePopupTextVisible();
+      const yesHideButton = yesHideButtonVisible();
+
+      if (popupVisible || yesHideButton) {
+        sawPopup = true;
+      }
+
+      if (yesHideButton) {
+        console.log("Clicking Yes, Hide confirmation button...");
+        clickElementOrClickableAncestor(yesHideButton);
+        clicked = true;
+
+        const closeStarted = Date.now();
+
+        while (Date.now() - closeStarted < 5500) {
+          await sleep(250);
+
+          const stillPopup = hidePopupTextVisible();
+          const stillButton = yesHideButtonVisible();
+
+          if (!stillPopup && !stillButton) {
+            console.log("Hide confirmation popup closed.");
+            return true;
+          }
+        }
+
+        console.warn("Clicked Yes, Hide, but the hide confirmation popup still appears to be open.");
+        return false;
+      }
+
+      if (!sawPopup && Date.now() - started > 2500) {
+        console.log("No Hide chat confirmation popup detected after waiting.");
+        return true;
+      }
     }
 
-    if (!isHideChatModalOpen()) {
-      console.log("No Hide chat confirmation popup detected.");
-      return true;
+    if (sawPopup && !clicked) {
+      console.warn("Hide chat popup appeared, but the Yes, Hide button was not found/clicked.");
+      return false;
     }
 
-    return await clickModalAction({
-      modalTextRegex: /hide chat\?/i,
-      actionTextRegex: /^yes,\s*hide$|^yes\s*hide$|^hide$/i,
-      actionName: "Yes, Hide"
-    });
+    return !sawPopup;
   };
 
   const isOwnMessage = (eventEl) => {
@@ -1631,7 +1756,7 @@ if generate:
             7. Select the chats in the popup.
             8. Click **Delete/hide selected chats**.
 
-            This version should stop the fake repeated “Deleted 1” loop. It only counts a delete after the popup closes and the same message is gone.
+            This version fixes the hide confirmation popup. It waits for and clicks **Yes, Hide** before moving on.
             """
         )
 
@@ -1640,7 +1765,7 @@ if generate:
         st.download_button(
             label="Download script as .js",
             data=script,
-            file_name="reddit_selected_chat_delete_hide_real_progress_fix.js",
+            file_name="reddit_selected_chat_delete_hide_yes_hide_fix.js",
             mime="text/javascript",
             use_container_width=True
         )
