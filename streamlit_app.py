@@ -680,11 +680,41 @@ JS_TEMPLATE = r"""
     return unique;
   };
 
+  
+  const getVisiblePageTextDeep = () => {
+    try {
+      const text = deepQueryAll(
+        [
+          "dialog",
+          "[role='dialog']",
+          "div",
+          "section",
+          "article",
+          "h1",
+          "h2",
+          "h3",
+          "p",
+          "span",
+          "button",
+          "[role='button']",
+          "rs-button"
+        ].join(",")
+      )
+        .filter(isVisible)
+        .map(getReadableText)
+        .filter(Boolean)
+        .join(" ");
+
+      return normalizeText(`${document.body.innerText || ""} ${text}`);
+    } catch {
+      return normalizeText(document.body.innerText || "");
+    }
+  };
   const isDeleteMessageModalOpen = () =>
-    normalizeText(document.body.innerText).includes("delete this message?");
+    getVisiblePageTextDeep().includes("delete this message?");
 
   const isHideChatModalOpen = () =>
-    normalizeText(document.body.innerText).includes("hide chat?");
+    getVisiblePageTextDeep().includes("hide chat?");
 
   const clickModalAction = async ({ modalTextRegex, actionTextRegex, actionName }) => {
     const started = Date.now();
@@ -692,10 +722,10 @@ JS_TEMPLATE = r"""
     while (Date.now() - started < CONFIRM_TIMEOUT_MS) {
       await sleep(250);
 
-      const bodyText = normalizeText(document.body.innerText);
-      const modalOpen = modalTextRegex.test(bodyText);
+      const visibleText = getVisiblePageTextDeep();
+      const modalOpen = modalTextRegex.test(visibleText);
 
-      if (!modalOpen && Date.now() - started > 1000) {
+      if (!modalOpen && Date.now() - started > 1200) {
         return false;
       }
 
@@ -703,10 +733,17 @@ JS_TEMPLATE = r"""
         .filter(isVisible)
         .map((button) => {
           const r = button.getBoundingClientRect();
+          let background = "";
+
+          try {
+            background = getComputedStyle(button).backgroundColor || "";
+          } catch {}
+
           return {
             button,
             text: normalizeText(getReadableText(button)),
-            r
+            r,
+            background
           };
         });
 
@@ -721,13 +758,22 @@ JS_TEMPLATE = r"""
             return (
               r.width >= 40 &&
               r.height >= 24 &&
-              r.top > 160 &&
+              r.top > 140 &&
+              r.bottom < window.innerHeight &&
               !/^x$|^close$|^cancel$/i.test(text)
             );
           })
           .sort((a, b) => {
-            if (Math.abs(b.r.right - a.r.right) > 8) return b.r.right - a.r.right;
-            return b.r.bottom - a.r.bottom;
+            const aActionText = /yes|delete|hide/.test(a.text) ? 4000 : 0;
+            const bActionText = /yes|delete|hide/.test(b.text) ? 4000 : 0;
+
+            const aDark = /rgb\(0,\s*0,\s*0\)|rgba\(0,\s*0,\s*0/i.test(a.background) ? 1000 : 0;
+            const bDark = /rgb\(0,\s*0,\s*0\)|rgba\(0,\s*0,\s*0/i.test(b.background) ? 1000 : 0;
+
+            const aScore = aActionText + aDark + a.r.right + a.r.bottom * 0.1;
+            const bScore = bActionText + bDark + b.r.right + b.r.bottom * 0.1;
+
+            return bScore - aScore;
           });
 
         target = modalButtons[0];
@@ -740,17 +786,18 @@ JS_TEMPLATE = r"""
 
         const waitStarted = Date.now();
 
-        while (Date.now() - waitStarted < 5000) {
+        while (Date.now() - waitStarted < 6500) {
           await sleep(250);
 
-          const afterText = normalizeText(document.body.innerText);
+          const afterText = getVisiblePageTextDeep();
 
           if (!modalTextRegex.test(afterText)) {
+            await sleep(300);
             return true;
           }
         }
 
-        console.warn(`${actionName} was clicked, but the modal is still open.`);
+        console.warn(`${actionName} was clicked, but the modal is still open. Stopping this action before doing anything else.`);
         return false;
       }
     }
@@ -1321,85 +1368,149 @@ JS_TEMPLATE = r"""
     return false;
   };
 
+  const getUsefulChatName = (chatText) => {
+    const cleaned = cleanText(chatText)
+      .replace(/^\d+\.\s*/, "")
+      .replace(/^\[deleted chat\]\s*/i, "");
+
+    const withoutDate = cleaned
+      .replace(/\bjan\b.*$/i, "")
+      .replace(/\bfeb\b.*$/i, "")
+      .replace(/\bmar\b.*$/i, "")
+      .replace(/\bapr\b.*$/i, "")
+      .replace(/\bmay\b.*$/i, "")
+      .replace(/\bjun\b.*$/i, "")
+      .replace(/\bjul\b.*$/i, "")
+      .replace(/\baug\b.*$/i, "")
+      .replace(/\bsep\b.*$/i, "")
+      .replace(/\boct\b.*$/i, "")
+      .replace(/\bnov\b.*$/i, "")
+      .replace(/\bdec\b.*$/i, "")
+      .trim();
+
+    return withoutDate || cleaned;
+  };
+
+  const chatTextMatchScore = (candidate, savedChat) => {
+    const candidateRaw = normalizeText(candidate.rawText || candidate.text || "");
+    const candidateText = normalizeText(candidate.text || "");
+    const savedRaw = normalizeText(savedChat.rawText || savedChat.text || "");
+    const savedText = normalizeText(savedChat.text || "");
+    const savedName = normalizeText(getUsefulChatName(savedChat.rawText || savedChat.text || ""));
+    const candidateName = normalizeText(getUsefulChatName(candidate.rawText || candidate.text || ""));
+
+    let score = 0;
+
+    if (savedChat.href && candidate.href && savedChat.href === candidate.href) score += 100000;
+    if (savedChat.key && candidate.key && savedChat.key === candidate.key) score += 40000;
+
+    if (savedRaw && candidateRaw === savedRaw) score += 30000;
+    if (savedText && candidateText === savedText) score += 25000;
+
+    if (savedRaw && candidateRaw.includes(savedRaw)) score += 12000;
+    if (savedRaw && savedRaw.includes(candidateRaw)) score += 8000;
+
+    if (savedName && candidateName === savedName) score += 15000;
+    if (savedName && candidateName.includes(savedName)) score += 9000;
+    if (savedName && savedName.includes(candidateName)) score += 6000;
+
+    if (savedChat.normalizedText?.includes("[deleted]") && candidate.normalizedText?.includes("[deleted]")) {
+      score += 12000;
+    }
+
+    // Date/name rows can shift after hiding. Position is only a weak fallback now.
+    if (savedChat.top != null && candidate.top != null) {
+      const distance = Math.abs(candidate.top - savedChat.top);
+      if (distance < 8) score += 2000;
+      else if (distance < 26) score += 500;
+    }
+
+    return score;
+  };
+
   const findChatElementFromSavedChat = async (savedChat) => {
     await returnToChatListIfNeeded();
 
     const candidates = getChatCandidates();
 
-    let match = null;
+    let best = candidates
+      .map((chat) => ({
+        chat,
+        score: chatTextMatchScore(chat, savedChat)
+      }))
+      .filter((item) => item.score > 0)
+      .sort((a, b) => b.score - a.score)[0]?.chat || null;
 
-    if (savedChat.href) {
-      match = candidates.find((chat) => chat.href === savedChat.href);
-    }
-
-    if (!match && savedChat.key) {
-      match = candidates.find((chat) => chat.key === savedChat.key);
-    }
-
-    if (!match && savedChat.rawText) {
-      const savedRaw = normalizeText(savedChat.rawText);
-
-      match = candidates.find((chat) => {
-        const currentRaw = normalizeText(chat.rawText);
-
-        return (
-          currentRaw === savedRaw ||
-          currentRaw.includes(savedRaw) ||
-          savedRaw.includes(currentRaw)
-        );
-      });
-    }
-
-    if (!match && savedChat.top != null) {
-      match = candidates
-        .map((chat) => ({
-          chat,
-          distance: Math.abs(chat.top - savedChat.top)
-        }))
-        .filter((x) => x.distance < 26)
-        .sort((a, b) => a.distance - b.distance)[0]?.chat || null;
-    }
-
-    if (!match && savedChat.normalizedText?.includes("[deleted]")) {
-      match = candidates.find((chat) => {
-        return chat.normalizedText.includes("[deleted]") || chat.text.toLowerCase().includes("[deleted]");
-      });
-    }
-
-    if (match && match.element && isVisible(match.element)) {
-      return match.element;
+    if (best && best.element && isVisible(best.element)) {
+      return best.element;
     }
 
     return null;
   };
 
-  const clickChat = async (savedChat) => {
-    console.log(`Opening selected chat: ${savedChat.text || savedChat.rawText || savedChat.key}`);
+  const tryClickChatRowAndWait = async (rowEl, savedChat) => {
+    if (!rowEl || !isVisible(rowEl)) return false;
 
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      const chatEl = await findChatElementFromSavedChat(savedChat);
+    rowEl.scrollIntoView({ block: "center" });
+    await sleep(250);
 
-      if (chatEl) {
-        chatEl.scrollIntoView({ block: "center" });
-        await sleep(250);
-        clickRowByCoordinates(chatEl, savedChat);
-      } else if (savedChat.clickX != null && savedChat.clickY != null) {
-        console.warn(`Could not rematch row on attempt ${attempt}. Trying saved coordinates...`);
-        clickAt(savedChat.clickX, savedChat.clickY);
-      } else {
-        console.warn(`Could not find chat row on attempt ${attempt}.`);
-        return false;
-      }
+    const r = rowEl.getBoundingClientRect();
+
+    const y = r.top + r.height / 2;
+
+    const clickPoints = [
+      // Text area first. This avoids the hover pin/action icon that can appear on the row.
+      [Math.min(Math.max(r.left + 145, 18), Math.min(r.right - 20, sidebarRight() - 20)), y],
+      [Math.min(Math.max(r.left + 215, 18), Math.min(r.right - 20, sidebarRight() - 20)), y],
+      [Math.min(Math.max(r.left + 75, 18), Math.min(r.right - 20, sidebarRight() - 20)), y],
+      [Math.min(Math.max(r.left + 30, 18), Math.min(r.right - 20, sidebarRight() - 20)), y]
+    ];
+
+    for (const [x, pointY] of clickPoints) {
+      clickAt(x, pointY);
 
       const opened = await waitForChatOpen();
 
-      if (opened) {
-        console.log("Chat opened.");
-        return true;
+      if (opened) return true;
+
+      await sleep(350);
+    }
+
+    return false;
+  };
+
+  const clickChat = async (savedChat) => {
+    console.log(`Opening selected chat: ${savedChat.text || savedChat.rawText || savedChat.key}`);
+
+    await closeDeleteModalIfStillOpen();
+
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      const chatEl = await findChatElementFromSavedChat(savedChat);
+
+      if (chatEl) {
+        const opened = await tryClickChatRowAndWait(chatEl, savedChat);
+
+        if (opened) {
+          console.log("Chat opened.");
+          return true;
+        }
+      } else if (savedChat.clickX != null && savedChat.clickY != null) {
+        console.warn(`Could not rematch row on attempt ${attempt}. Trying saved coordinates as last resort...`);
+
+        clickAt(savedChat.clickX, savedChat.clickY);
+
+        const opened = await waitForChatOpen();
+
+        if (opened) {
+          console.log("Chat opened.");
+          return true;
+        }
+      } else {
+        console.warn(`Could not find chat row on attempt ${attempt}.`);
       }
 
-      console.warn(`Chat did not open on attempt ${attempt}. Retrying...`);
-      await sleep(650);
+      console.warn(`Chat did not open on attempt ${attempt}. Re-scanning sidebar and retrying...`);
+      await sleep(700);
     }
 
     console.warn(`Could not open chat after retries: ${savedChat.text || savedChat.rawText || savedChat.key}`);
@@ -1652,9 +1763,9 @@ JS_TEMPLATE = r"""
     return;
   }
 
-  const selectedChats = HIDE_AFTER_DELETE
-    ? [...selectedChatsRaw].sort((a, b) => (b.top ?? 0) - (a.top ?? 0))
-    : selectedChatsRaw;
+  // Process top-down in the same order shown in the picker.
+  // After every hide, the script re-scans the visible sidebar and matches the next chat by text.
+  const selectedChats = selectedChatsRaw;
 
   console.log(`Selected ${selectedChats.length} chat(s).`);
   console.log(`Speed: up to ${MAX_DELETES_PER_MINUTE} deletes per minute.`);
