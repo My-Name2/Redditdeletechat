@@ -65,6 +65,7 @@ JS_TEMPLATE = r"""
 // Retries failed visible messages until they disappear or the safety limit is reached.
 // Hides chats by clicking the top-right gear, then Hide chat, then Yes, Hide.
 // Handles [deleted] chat rows if Reddit shows them in the sidebar.
+// Deduplicates nested sidebar rows so each chat should appear once.
 // Does NOT delete comments.
 // Does NOT delete posts.
 // Run on any Reddit chat page where the left chat sidebar is visible.
@@ -499,9 +500,9 @@ JS_TEMPLATE = r"""
           r.left >= 0 &&
           r.left < window.innerWidth * 0.36 &&
           r.width >= 120 &&
-          r.width <= 340 &&
-          r.height >= 28 &&
-          r.height <= 120;
+          r.width <= 360 &&
+          r.height >= 24 &&
+          r.height <= 130;
 
         const notTopNav = r.top > 85;
 
@@ -531,30 +532,81 @@ JS_TEMPLATE = r"""
       return ar.left - br.left;
     });
 
-    const unique = [];
-    const usedRows = [];
-    const duplicateCounter = new Map();
+    const rowGroups = [];
 
     for (const el of sorted) {
       const r = el.getBoundingClientRect();
+      const text = cleanText(getReadableText(el));
+      const centerY = r.top + r.height / 2;
+
+      const existingGroup = rowGroups.find((group) => {
+        const groupCenter = group.centerY;
+        const groupTop = group.top;
+        const groupBottom = group.bottom;
+
+        const overlapTop = Math.max(groupTop, r.top);
+        const overlapBottom = Math.min(groupBottom, r.bottom);
+        const overlap = Math.max(0, overlapBottom - overlapTop);
+        const smallerHeight = Math.min(groupBottom - groupTop, r.height);
+
+        const overlapsSameRow =
+          smallerHeight > 0 && overlap / smallerHeight > 0.45;
+
+        const closeCenter = Math.abs(groupCenter - centerY) < 30;
+
+        return overlapsSameRow || closeCenter;
+      });
+
+      const candidate = {
+        el,
+        rect: r,
+        text,
+        centerY,
+        score:
+          r.width +
+          r.height +
+          (getElementHref(el) ? 100 : 0) +
+          (text.includes("[deleted]") ? 50 : 0) +
+          (text.includes("You:") ? 25 : 0)
+      };
+
+      if (existingGroup) {
+        existingGroup.items.push(candidate);
+        existingGroup.top = Math.min(existingGroup.top, r.top);
+        existingGroup.bottom = Math.max(existingGroup.bottom, r.bottom);
+        existingGroup.centerY = (existingGroup.top + existingGroup.bottom) / 2;
+      } else {
+        rowGroups.push({
+          top: r.top,
+          bottom: r.bottom,
+          centerY,
+          items: [candidate]
+        });
+      }
+    }
+
+    const bestRows = rowGroups.map((group) => {
+      return group.items.sort((a, b) => b.score - a.score)[0];
+    });
+
+    const unique = [];
+    const duplicateCounter = new Map();
+
+    for (const item of bestRows) {
+      const el = item.el;
+      const r = item.rect;
+
+      const href = getElementHref(el);
       const text = cleanText(getReadableText(el)).slice(0, 220);
       const normalizedText = normalizeTextForMatch(text);
 
-      const sameVisualRow = usedRows.some((row) => {
-        return Math.abs(row.top - r.top) < 10;
-      });
-
-      if (sameVisualRow) continue;
-
-      usedRows.push({ top: r.top });
-
-      const href = getElementHref(el);
+      if (!text || text.length < 2) continue;
 
       const currentDupIndex = duplicateCounter.get(normalizedText) || 0;
       duplicateCounter.set(normalizedText, currentDupIndex + 1);
 
       const geometryKey = `${Math.round(r.top)}:${Math.round(r.left)}:${Math.round(r.width)}:${Math.round(r.height)}`;
-      const key = href || `${normalizedText || text}::dup${currentDupIndex}::${geometryKey}`;
+      const key = href || `${normalizedText || text}::row${unique.length}::${geometryKey}`;
 
       let displayText = text || href || "[unknown chat]";
 
@@ -1018,13 +1070,7 @@ JS_TEMPLATE = r"""
         checkbox.style.marginTop = "3px";
 
         const label = document.createElement("span");
-
-        const duplicateNote =
-          chat.duplicateIndex > 0
-            ? ` duplicate #${chat.duplicateIndex + 1}`
-            : "";
-
-        label.textContent = `${index + 1}. ${chat.text}${duplicateNote}`;
+        label.textContent = `${index + 1}. ${chat.text}`;
 
         row.appendChild(checkbox);
         row.appendChild(label);
@@ -1185,7 +1231,7 @@ if generate:
             9. Select the chats in the popup.
             10. Click **Delete/hide selected chats**.
 
-            This version should click **Hide chat**, wait for the popup, then click **Yes, Hide**.
+            This version deduplicates nested sidebar rows, so each visible chat should appear once.
             """
         )
 
@@ -1194,7 +1240,7 @@ if generate:
         st.download_button(
             label="Download script as .js",
             data=script,
-            file_name="reddit_selected_chat_delete_hide_yes_hide_deleted_fix.js",
+            file_name="reddit_selected_chat_delete_hide_deduped.js",
             mime="text/javascript",
             use_container_width=True
         )
