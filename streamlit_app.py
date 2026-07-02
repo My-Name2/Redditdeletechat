@@ -60,7 +60,7 @@ generate = st.button(
 
 JS_TEMPLATE = r"""
 // Reddit Selected-Chat Own-Message Bulk Delete + Hide
-// Fix version: aggressive sidebar row detection for [deleted] chats.
+// Fix version: robust text conversion + aggressive sidebar row detection for [deleted] chats.
 // Deletes only YOUR sent chat messages.
 // Does NOT delete comments.
 // Does NOT delete posts.
@@ -87,7 +87,51 @@ JS_TEMPLATE = r"""
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   const escapeRegExp = (value) =>
-    value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+  const safeString = (value) => {
+    try {
+      if (value === null || value === undefined) return "";
+
+      if (typeof value === "string") return value;
+      if (typeof value === "number" || typeof value === "boolean") return String(value);
+
+      if (typeof value === "object") {
+        if ("baseVal" in value) return String(value.baseVal || "");
+        if ("animVal" in value) return String(value.animVal || "");
+        if ("value" in value) return String(value.value || "");
+      }
+
+      return String(value);
+    } catch {
+      return "";
+    }
+  };
+
+  const getAttributeSafe = (el, name) => {
+    try {
+      if (!el || !el.getAttribute) return "";
+      return safeString(el.getAttribute(name));
+    } catch {
+      return "";
+    }
+  };
+
+  const getHrefSafe = (el) => {
+    try {
+      if (!el) return "";
+
+      const hrefProp = safeString(el.href);
+      if (hrefProp) return hrefProp;
+
+      const hrefAttr = getAttributeSafe(el, "href");
+      if (hrefAttr) return hrefAttr;
+
+      return "";
+    } catch {
+      return "";
+    }
+  };
 
   const sidebarRight = () => {
     return Math.min(430, Math.max(285, window.innerWidth * 0.40));
@@ -168,18 +212,21 @@ JS_TEMPLATE = r"""
   };
 
   const getReadableText = (el) => {
-    return (
-      el.innerText ||
-      el.textContent ||
-      el.getAttribute("aria-label") ||
-      el.getAttribute("title") ||
-      el.href ||
-      ""
-    ).trim();
+    if (!el) return "";
+
+    const candidates = [
+      safeString(el.innerText),
+      safeString(el.textContent),
+      getAttributeSafe(el, "aria-label"),
+      getAttributeSafe(el, "title"),
+      getHrefSafe(el)
+    ];
+
+    return candidates.find((value) => value && value.trim())?.trim() || "";
   };
 
   const cleanText = (text) => {
-    return String(text || "")
+    return safeString(text)
       .replace(/\s+/g, " ")
       .trim();
   };
@@ -194,10 +241,8 @@ JS_TEMPLATE = r"""
     const link = localQuery(el, "a");
 
     return (
-      el.href ||
-      el.getAttribute("href") ||
-      link?.href ||
-      link?.getAttribute("href") ||
+      getHrefSafe(el) ||
+      getHrefSafe(link) ||
       ""
     );
   };
@@ -262,15 +307,15 @@ JS_TEMPLATE = r"""
   const isSidebarRowRect = (r) => {
     return (
       r.left >= -5 &&
-      r.left < 90 &&
-      r.right > 160 &&
-      r.right <= sidebarRight() + 60 &&
-      r.width >= 150 &&
-      r.width <= sidebarRight() + 80 &&
-      r.height >= 38 &&
-      r.height <= 92 &&
-      r.top >= 105 &&
-      r.bottom <= window.innerHeight + 8
+      r.left < 95 &&
+      r.right > 150 &&
+      r.right <= sidebarRight() + 75 &&
+      r.width >= 140 &&
+      r.width <= sidebarRight() + 90 &&
+      r.height >= 34 &&
+      r.height <= 100 &&
+      r.top >= 96 &&
+      r.bottom <= window.innerHeight + 12
     );
   };
 
@@ -290,7 +335,7 @@ JS_TEMPLATE = r"""
     const cleaned = cleanText(text);
 
     if (!cleaned || cleaned.length < 2) return false;
-    if (cleaned.length > 320) return false;
+    if (cleaned.length > 360) return false;
     if (isBadSidebarText(cleaned)) return false;
 
     return true;
@@ -305,23 +350,23 @@ JS_TEMPLATE = r"""
     if (!isSidebarRowRect(r)) return -Infinity;
     if (!rowTextLooksPossible(text)) return -Infinity;
 
-    const tag = el.tagName?.toLowerCase() || "";
-    const role = el.getAttribute?.("role") || "";
+    const tag = safeString(el.tagName).toLowerCase();
+    const role = getAttributeSafe(el, "role");
 
     let score = 0;
 
-    score += Math.min(r.width, 360) * 4;
-    score += Math.min(r.height, 90) * 4;
+    score += Math.min(r.width, 380) * 4;
+    score += Math.min(r.height, 95) * 4;
 
     if (getElementHref(el)) score += 250;
-    if (text.includes("[deleted]")) score += 500;
-    if (text.includes("You:")) score += 200;
-    if (/yesterday|today|jun|jul|aug|sep|oct|nov|dec|jan|feb|mar|apr|may|\d{1,2}:\d{2}\s?(am|pm)?/i.test(text)) score += 160;
+    if (text.includes("[deleted]")) score += 800;
+    if (text.includes("You:")) score += 250;
+    if (/yesterday|today|jun|jul|aug|sep|oct|nov|dec|jan|feb|mar|apr|may|\d{1,2}:\d{2}\s?(am|pm)?/i.test(text)) score += 180;
 
     if (tag === "button" || tag === "a") score += 120;
     if (role === "button" || role === "link" || role === "listitem" || role === "option") score += 120;
 
-    if (text.length > 240) score -= 40;
+    if (text.length > 260) score -= 40;
 
     return score;
   };
@@ -332,7 +377,7 @@ JS_TEMPLATE = r"""
     let bestScore = -Infinity;
     let depth = 0;
 
-    while (el && el !== document.body && depth < 16) {
+    while (el && el !== document.body && depth < 18) {
       const score = scorePossibleChatRow(el);
 
       if (score > bestScore) {
@@ -375,11 +420,11 @@ JS_TEMPLATE = r"""
     const found = [];
     const seen = new Set();
 
-    const maxX = Math.min(sidebarRight() - 12, 360);
-    const sampleXs = [12, 24, 40, 58, 78, 105, 135, 170, 210, 250, 285, 320, 350]
+    const maxX = Math.min(sidebarRight() - 12, 380);
+    const sampleXs = [8, 16, 24, 36, 50, 66, 84, 105, 130, 160, 195, 235, 275, 315, 355]
       .filter((x) => x > 0 && x < maxX);
 
-    for (let y = 105; y < window.innerHeight - 5; y += 5) {
+    for (let y = 96; y < window.innerHeight - 5; y += 4) {
       for (const x of sampleXs) {
         const pointEl = document.elementFromPoint(x, y);
         if (!pointEl) continue;
@@ -390,7 +435,7 @@ JS_TEMPLATE = r"""
         const r = row.getBoundingClientRect();
         const text = cleanText(getReadableText(row));
 
-        const key = `${Math.round(r.top)}:${Math.round(r.left)}:${Math.round(r.width)}:${Math.round(r.height)}:${text.slice(0, 80)}`;
+        const key = `${Math.round(r.top)}:${Math.round(r.left)}:${Math.round(r.width)}:${Math.round(r.height)}:${text.slice(0, 90)}`;
 
         if (seen.has(key)) continue;
 
@@ -480,7 +525,7 @@ JS_TEMPLATE = r"""
       const r = item.rect;
 
       const href = getElementHref(el);
-      const text = cleanText(getReadableText(el)).slice(0, 280);
+      const text = cleanText(getReadableText(el)).slice(0, 300);
       const normalizedText = normalizeTextForMatch(text);
 
       if (!rowTextLooksPossible(text)) continue;
@@ -548,7 +593,7 @@ JS_TEMPLATE = r"""
 
   const isOwnMessage = (eventEl) => {
     const msg = localQuery(eventEl, ".room-message[aria-label], [aria-label]");
-    const aria = msg?.getAttribute("aria-label") || "";
+    const aria = getAttributeSafe(msg, "aria-label");
 
     return new RegExp(
       "^" + escapeRegExp(USERNAME) + "\\s+said\\b",
@@ -1257,7 +1302,6 @@ JS_TEMPLATE = r"""
     return;
   }
 
-  // If hiding is on, process from bottom to top so hiding a lower row does not shift rows above it.
   const selectedChats = HIDE_AFTER_DELETE
     ? [...selectedChatsRaw].sort((a, b) => (b.top ?? 0) - (a.top ?? 0))
     : selectedChatsRaw;
@@ -1355,7 +1399,7 @@ if generate:
             7. Select the chats in the popup.
             8. Click **Delete/hide selected chats**.
 
-            This version aggressively scans the visible sidebar for `[deleted]` rows and processes selected chats from bottom to top when hiding is enabled.
+            This version fixes the `.trim is not a function` error and aggressively scans the visible sidebar for `[deleted]` rows.
             """
         )
 
@@ -1364,7 +1408,7 @@ if generate:
         st.download_button(
             label="Download script as .js",
             data=script,
-            file_name="reddit_selected_chat_delete_hide_deleted_aggressive_scan.js",
+            file_name="reddit_selected_chat_delete_hide_deleted_trim_fix.js",
             mime="text/javascript",
             use_container_width=True
         )
