@@ -2,12 +2,12 @@ import json
 import streamlit as st
 
 st.set_page_config(
-    page_title="Reddit Chat Delete Script Generator",
+    page_title="Reddit Chat Delete/Hide Script Generator",
     page_icon="🧹",
     layout="centered"
 )
 
-st.title("Reddit Chat Delete Script Generator")
+st.title("Reddit Chat Delete/Hide Script Generator")
 st.caption("Generate a selected-chat delete/hide script, then paste it into Reddit's DevTools Console.")
 
 st.warning(
@@ -49,7 +49,7 @@ no_progress_rounds = st.slider(
 hide_after_delete = st.checkbox(
     "Hide selected chats after cleaning",
     value=True,
-    help="After deleting your sent messages in a selected chat, the script will try to click Reddit's Hide Chat option."
+    help="After deleting your sent messages in a selected chat, the script will click the top-right gear, then Hide chat."
 )
 
 generate = st.button(
@@ -59,15 +59,14 @@ generate = st.button(
 )
 
 JS_TEMPLATE = r"""
-// Reddit Selected-Chat Own-Message Bulk Delete with Retry + Hide + Deleted-User Chat Support
+// Reddit Selected-Chat Own-Message Bulk Delete + Hide
 // Shows a checkbox picker first.
-// Deletes only YOUR sent messages in the selected chats.
+// Deletes only YOUR sent messages in selected chats.
 // Retries failed visible messages until they disappear or the safety limit is reached.
-// Can hide selected chats after cleaning.
-// Handles chats named [deleted] as visible chat rows.
+// Hides chats by clicking the top-right gear, then Hide chat.
+// Handles [deleted] chat rows if Reddit shows them in the sidebar.
 // Does NOT delete comments.
 // Does NOT delete posts.
-// Works on Reddit chat pages even if the URL is not exactly /chat.
 // Run on any Reddit chat page where the left chat sidebar is visible.
 
 (async () => {
@@ -84,7 +83,7 @@ JS_TEMPLATE = r"""
   const SCROLL_DELAY_MS = 600;
   const CHAT_SWITCH_DELAY_MS = 1800;
   const SIDEBAR_RECOVERY_DELAY_MS = 1400;
-  const HIDE_DELAY_MS = 1000;
+  const HIDE_DELAY_MS = 1200;
   const GONE_CHECK_TIMEOUT_MS = 2500;
   const GONE_CHECK_INTERVAL_MS = 150;
 
@@ -202,6 +201,31 @@ JS_TEMPLATE = r"""
     );
   };
 
+  const clickElementOrClickableAncestor = (el) => {
+    if (!el) return false;
+
+    const clickable = el.closest?.(
+      'button, [role="button"], [role="menuitem"], a, rs-button, rs-menu-item, rs-dropdown-item'
+    );
+
+    if (clickable && isVisible(clickable)) {
+      clickable.click();
+      return true;
+    }
+
+    el.click();
+    return true;
+  };
+
+  const findVisibleByText = (selectors, regex) => {
+    return deepQueryAll(selectors)
+      .filter(isVisible)
+      .find((el) => {
+        const text = cleanText(getReadableText(el));
+        return regex.test(text);
+      });
+  };
+
   const isOwnMessage = (eventEl) => {
     const msg = localQuery(eventEl, ".room-message[aria-label], [aria-label]");
     const aria = msg?.getAttribute("aria-label") || "";
@@ -226,9 +250,8 @@ JS_TEMPLATE = r"""
   const confirmDeleteDialog = async () => {
     await sleep(CONFIRM_DELAY_MS);
 
-    const buttons = deepQueryAll('button, [role="button"], rs-button').filter(
-      isVisible
-    );
+    const buttons = deepQueryAll('button, [role="button"], rs-button')
+      .filter(isVisible);
 
     const confirm = buttons.find((b) => {
       const text = getReadableText(b).toLowerCase();
@@ -705,52 +728,16 @@ JS_TEMPLATE = r"""
     return true;
   };
 
-  const findHideChatItem = () => {
-    const items = deepQueryAll(
-      [
-        '[role="menuitem"]',
-        'rs-menu-item',
-        'rs-dropdown-item',
-        'button',
-        '[role="button"]'
-      ].join(",")
-    ).filter(isVisible);
-
-    return items.find((el) => {
-      const text = cleanText(getReadableText(el)).toLowerCase();
-
-      return (
-        text === "hide chat" ||
-        text === "hide" ||
-        /hide\s+chat/i.test(text)
-      );
-    });
-  };
-
   const clickConfirmHideIfNeeded = async () => {
     await sleep(500);
 
-    const buttons = deepQueryAll(
-      [
-        'button',
-        '[role="button"]',
-        'rs-button'
-      ].join(",")
-    ).filter(isVisible);
+    const confirmButton = findVisibleByText(
+      ['button', '[role="button"]', 'rs-button'].join(","),
+      /^(hide|hide chat|yes, hide|confirm)$/i
+    );
 
-    const confirm = buttons.find((button) => {
-      const text = cleanText(getReadableText(button)).toLowerCase();
-
-      return (
-        text === "hide" ||
-        text === "hide chat" ||
-        text === "yes, hide" ||
-        text === "confirm"
-      );
-    });
-
-    if (confirm) {
-      confirm.click();
+    if (confirmButton) {
+      clickElementOrClickableAncestor(confirmButton);
       await sleep(HIDE_DELAY_MS);
       return true;
     }
@@ -758,36 +745,49 @@ JS_TEMPLATE = r"""
     return false;
   };
 
-  const hideCurrentChat = async () => {
-    console.log("Trying to hide current chat...");
+  const openChatSettings = async () => {
+    console.log("Trying to open chat settings...");
 
-    let hideItem = findHideChatItem();
+    const alreadySettings = findVisibleByText(
+      ['h1', 'h2', 'h3', 'div', 'span'].join(","),
+      /^chat settings$/i
+    );
 
-    if (hideItem) {
-      hideItem.click();
-      await clickConfirmHideIfNeeded();
-      console.log("Hide Chat clicked.");
+    if (alreadySettings) {
+      console.log("Already on Chat settings screen.");
       return true;
     }
 
-    const menuCandidates = deepQueryAll(
+    const labeledGear = deepQueryAll(
       [
         'button[aria-label*="settings" i]',
+        '[role="button"][aria-label*="settings" i]',
         'button[title*="settings" i]',
-        '[aria-label*="settings" i]',
         '[title*="settings" i]',
-        'button[aria-label*="more" i]',
-        'button[title*="more" i]',
-        '[aria-label*="more" i]',
-        '[title*="more" i]',
-        'button[aria-label*="options" i]',
-        '[aria-label*="options" i]',
-        'button[aria-haspopup="menu"]',
-        '[role="button"][aria-haspopup="menu"]',
         'rs-icon-button[icon="settings"]',
         'rs-icon-button[name="settings"]',
-        'rs-icon-button[icon="more"]',
-        'rs-icon-button[name="more"]'
+        'button[aria-label*="chat settings" i]',
+        '[role="button"][aria-label*="chat settings" i]'
+      ].join(",")
+    )
+      .filter(isVisible)
+      .sort((a, b) => {
+        const ar = a.getBoundingClientRect();
+        const br = b.getBoundingClientRect();
+        return br.left - ar.left;
+      })[0];
+
+    if (labeledGear) {
+      clickElementOrClickableAncestor(labeledGear);
+      await sleep(900);
+      return true;
+    }
+
+    const topRightButtons = deepQueryAll(
+      [
+        'button',
+        '[role="button"]',
+        'rs-icon-button'
       ].join(",")
     )
       .filter(isVisible)
@@ -795,38 +795,78 @@ JS_TEMPLATE = r"""
         const r = el.getBoundingClientRect();
 
         return (
-          r.top > 40 &&
-          r.top < Math.max(240, window.innerHeight * 0.35) &&
-          r.left > window.innerWidth * 0.25
+          r.top >= 0 &&
+          r.top < 80 &&
+          r.left > window.innerWidth * 0.45 &&
+          r.right > window.innerWidth - 140 &&
+          r.width >= 16 &&
+          r.height >= 16
         );
       })
       .sort((a, b) => {
         const ar = a.getBoundingClientRect();
         const br = b.getBoundingClientRect();
 
-        if (Math.abs(br.left - ar.left) > 10) {
-          return br.left - ar.left;
-        }
-
-        return ar.top - br.top;
+        return br.right - ar.right;
       });
 
-    for (const button of menuCandidates) {
-      button.click();
-      await sleep(700);
-
-      hideItem = findHideChatItem();
-
-      if (hideItem) {
-        hideItem.click();
-        await clickConfirmHideIfNeeded();
-        console.log("Hide Chat clicked.");
-        return true;
-      }
+    if (topRightButtons.length > 0) {
+      clickElementOrClickableAncestor(topRightButtons[0]);
+      await sleep(900);
+      return true;
     }
 
-    console.warn("Could not find Hide Chat for this conversation.");
+    console.warn("Could not find the top-right chat settings gear.");
     return false;
+  };
+
+  const findHideChatButton = () => {
+    const candidates = deepQueryAll(
+      [
+        '[role="button"]',
+        'button',
+        'rs-button',
+        'rs-menu-item',
+        'rs-dropdown-item',
+        'div',
+        'span'
+      ].join(",")
+    ).filter(isVisible);
+
+    return candidates.find((el) => {
+      const text = cleanText(getReadableText(el));
+      return /^hide chat$/i.test(text) || /^hide$/i.test(text);
+    });
+  };
+
+  const hideCurrentChat = async () => {
+    console.log("Trying to hide current chat via gear → Hide chat...");
+
+    const openedSettings = await openChatSettings();
+
+    if (!openedSettings) {
+      console.warn("Could not open chat settings.");
+      return false;
+    }
+
+    await sleep(700);
+
+    const hideButton = findHideChatButton();
+
+    if (!hideButton) {
+      console.warn("Could not find Hide chat on the settings screen.");
+      return false;
+    }
+
+    clickElementOrClickableAncestor(hideButton);
+    await sleep(700);
+
+    await clickConfirmHideIfNeeded();
+
+    console.log("Hide chat clicked.");
+    await sleep(1200);
+
+    return true;
   };
 
   const showChatPicker = async () => {
@@ -1083,7 +1123,7 @@ if generate:
             9. Select the chats in the popup.
             10. Click **Delete selected chats**.
 
-            `[deleted]` chats are included if Reddit renders them in the sidebar. If there are several identical `[deleted]` rows with no unique link, the script labels duplicates as best it can.
+            This version hides chats by clicking the top-right gear, then **Hide chat**.
             """
         )
 
@@ -1092,7 +1132,7 @@ if generate:
         st.download_button(
             label="Download script as .js",
             data=script,
-            file_name="reddit_selected_chat_retry_delete_hide_deleted_support.js",
+            file_name="reddit_selected_chat_delete_hide_gear.js",
             mime="text/javascript",
             use_container_width=True
         )
