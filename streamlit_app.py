@@ -49,7 +49,7 @@ no_progress_rounds = st.slider(
 hide_after_delete = st.checkbox(
     "Hide selected chats after cleaning",
     value=True,
-    help="After deleting your sent messages in a selected chat, the script will click the top-right gear, then Hide chat."
+    help="After deleting your sent messages in a selected chat, the script will click the top-right gear, then Hide chat, then Yes, Hide."
 )
 
 generate = st.button(
@@ -63,7 +63,7 @@ JS_TEMPLATE = r"""
 // Shows a checkbox picker first.
 // Deletes only YOUR sent messages in selected chats.
 // Retries failed visible messages until they disappear or the safety limit is reached.
-// Hides chats by clicking the top-right gear, then Hide chat.
+// Hides chats by clicking the top-right gear, then Hide chat, then Yes, Hide.
 // Handles [deleted] chat rows if Reddit shows them in the sidebar.
 // Does NOT delete comments.
 // Does NOT delete posts.
@@ -83,7 +83,7 @@ JS_TEMPLATE = r"""
   const SCROLL_DELAY_MS = 600;
   const CHAT_SWITCH_DELAY_MS = 1800;
   const SIDEBAR_RECOVERY_DELAY_MS = 1400;
-  const HIDE_DELAY_MS = 1200;
+  const HIDE_DELAY_MS = 1800;
   const GONE_CHECK_TIMEOUT_MS = 2500;
   const GONE_CHECK_INTERVAL_MS = 150;
 
@@ -483,7 +483,8 @@ JS_TEMPLATE = r"""
       'rs-room-list-item',
       'rs-conversation-list-item',
       'button',
-      'a'
+      'a',
+      'div'
     ].join(",");
 
     const raw = deepQueryAll(selectors)
@@ -496,20 +497,30 @@ JS_TEMPLATE = r"""
 
         const inLeftSidebar =
           r.left >= 0 &&
-          r.left < window.innerWidth * 0.5 &&
-          r.width >= 90 &&
-          r.width <= window.innerWidth * 0.6 &&
-          r.height >= 24 &&
-          r.height <= 190;
+          r.left < window.innerWidth * 0.36 &&
+          r.width >= 120 &&
+          r.width <= 340 &&
+          r.height >= 28 &&
+          r.height <= 120;
 
-        const notTopNav = r.top > 55;
+        const notTopNav = r.top > 85;
+
+        const looksLikeChatRow =
+          text.includes("You:") ||
+          text.includes("[deleted]") ||
+          /yesterday|today|jun|jul|aug|sep|oct|nov|dec|jan|feb|mar|apr|may|\d{1,2}:\d{2}\s?(am|pm)?/i.test(text);
 
         const notObviousBadItem =
-          !/create|settings|logout|advertise|premium|popular|home|all|notifications|explore|search|close|back|help|privacy|terms|reddit recap|communities|custom feeds/i.test(
+          !/create|settings|logout|advertise|premium|popular|home|all|notifications|explore|search|close|back|help|privacy|terms|reddit recap|communities|custom feeds|threads$/i.test(
             text
           );
 
-        return inLeftSidebar && notTopNav && notObviousBadItem;
+        return (
+          inLeftSidebar &&
+          notTopNav &&
+          looksLikeChatRow &&
+          notObviousBadItem
+        );
       });
 
     const sorted = raw.sort((a, b) => {
@@ -521,29 +532,36 @@ JS_TEMPLATE = r"""
     });
 
     const unique = [];
-    const seen = new Set();
+    const usedRows = [];
     const duplicateCounter = new Map();
 
     for (const el of sorted) {
       const r = el.getBoundingClientRect();
-      const href = getElementHref(el);
       const text = cleanText(getReadableText(el)).slice(0, 220);
       const normalizedText = normalizeTextForMatch(text);
+
+      const sameVisualRow = usedRows.some((row) => {
+        return Math.abs(row.top - r.top) < 10;
+      });
+
+      if (sameVisualRow) continue;
+
+      usedRows.push({ top: r.top });
+
+      const href = getElementHref(el);
 
       const currentDupIndex = duplicateCounter.get(normalizedText) || 0;
       duplicateCounter.set(normalizedText, currentDupIndex + 1);
 
-      const baseKey = href || normalizedText || text;
       const geometryKey = `${Math.round(r.top)}:${Math.round(r.left)}:${Math.round(r.width)}:${Math.round(r.height)}`;
-      const key = href || `${baseKey}::dup${currentDupIndex}::${geometryKey}`;
-
-      if (!key || seen.has(key)) continue;
-
-      seen.add(key);
+      const key = href || `${normalizedText || text}::dup${currentDupIndex}::${geometryKey}`;
 
       let displayText = text || href || "[unknown chat]";
 
-      if (normalizedText === "[deleted]" || displayText.toLowerCase().includes("[deleted]")) {
+      if (
+        normalizedText.includes("[deleted]") ||
+        displayText.toLowerCase().includes("[deleted]")
+      ) {
         displayText = `[deleted chat] ${displayText}`;
       }
 
@@ -695,9 +713,9 @@ JS_TEMPLATE = r"""
       });
     }
 
-    if (!match && savedChat.normalizedText === "[deleted]") {
+    if (!match && savedChat.normalizedText?.includes("[deleted]")) {
       match = candidates.find((chat) => {
-        return chat.normalizedText === "[deleted]" || chat.text.toLowerCase().includes("[deleted]");
+        return chat.normalizedText.includes("[deleted]") || chat.text.toLowerCase().includes("[deleted]");
       });
     }
 
@@ -721,7 +739,7 @@ JS_TEMPLATE = r"""
 
     console.log(`Opening selected chat: ${savedChat.text || savedChat.rawText || savedChat.key}`);
 
-    chatEl.click();
+    clickElementOrClickableAncestor(chatEl);
 
     await sleep(CHAT_SWITCH_DELAY_MS);
 
@@ -729,20 +747,59 @@ JS_TEMPLATE = r"""
   };
 
   const clickConfirmHideIfNeeded = async () => {
-    await sleep(500);
+    console.log("Looking for Hide chat confirmation popup...");
 
-    const confirmButton = findVisibleByText(
-      ['button', '[role="button"]', 'rs-button'].join(","),
-      /^(hide|hide chat|yes, hide|confirm)$/i
-    );
+    const started = Date.now();
+    let sawPopup = false;
 
-    if (confirmButton) {
-      clickElementOrClickableAncestor(confirmButton);
-      await sleep(HIDE_DELAY_MS);
-      return true;
+    while (Date.now() - started < 6000) {
+      await sleep(250);
+
+      const bodyText = cleanText(document.body.innerText).toLowerCase();
+
+      if (bodyText.includes("hide chat?")) {
+        sawPopup = true;
+      }
+
+      const buttons = deepQueryAll(
+        [
+          'button',
+          '[role="button"]',
+          'rs-button'
+        ].join(",")
+      ).filter(isVisible);
+
+      const yesHideButton = buttons.find((button) => {
+        const text = cleanText(getReadableText(button)).toLowerCase();
+
+        return (
+          text === "yes, hide" ||
+          text === "yes hide" ||
+          text.includes("yes, hide") ||
+          text.includes("yes hide")
+        );
+      });
+
+      if (yesHideButton) {
+        console.log("Clicking Yes, Hide confirmation button...");
+        clickElementOrClickableAncestor(yesHideButton);
+        await sleep(HIDE_DELAY_MS);
+        return true;
+      }
+
+      if (!sawPopup && Date.now() - started > 2500 && !bodyText.includes("hide chat?")) {
+        console.log("No Hide chat confirmation popup detected. Assuming no confirmation was needed.");
+        return true;
+      }
     }
 
-    return false;
+    if (sawPopup) {
+      console.warn("Hide chat popup appeared, but Yes, Hide was not clicked.");
+      return false;
+    }
+
+    console.log("No Hide chat confirmation popup found.");
+    return true;
   };
 
   const openChatSettings = async () => {
@@ -840,7 +897,7 @@ JS_TEMPLATE = r"""
   };
 
   const hideCurrentChat = async () => {
-    console.log("Trying to hide current chat via gear → Hide chat...");
+    console.log("Trying to hide current chat via gear → Hide chat → Yes, Hide...");
 
     const openedSettings = await openChatSettings();
 
@@ -849,7 +906,7 @@ JS_TEMPLATE = r"""
       return false;
     }
 
-    await sleep(700);
+    await sleep(800);
 
     const hideButton = findHideChatButton();
 
@@ -858,14 +915,19 @@ JS_TEMPLATE = r"""
       return false;
     }
 
+    console.log("Clicking Hide chat...");
     clickElementOrClickableAncestor(hideButton);
-    await sleep(700);
 
-    await clickConfirmHideIfNeeded();
+    const confirmed = await clickConfirmHideIfNeeded();
 
-    console.log("Hide chat clicked.");
-    await sleep(1200);
+    if (!confirmed) {
+      console.warn("Hide chat confirmation was not completed.");
+      return false;
+    }
 
+    await sleep(1800);
+
+    console.log("Hide chat confirmed.");
     return true;
   };
 
@@ -932,7 +994,7 @@ JS_TEMPLATE = r"""
         <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:14px;">
           <button id="rcc-cancel" style="padding:10px 14px;cursor:pointer;">Cancel</button>
           <button id="rcc-run" style="padding:10px 14px;cursor:pointer;background:#ff4500;color:#fff;border:0;border-radius:6px;">
-            Delete selected chats
+            Delete/hide selected chats
           </button>
         </div>
       `;
@@ -1121,9 +1183,9 @@ if generate:
             7. Go to the **Console** tab.
             8. Paste the generated script.
             9. Select the chats in the popup.
-            10. Click **Delete selected chats**.
+            10. Click **Delete/hide selected chats**.
 
-            This version hides chats by clicking the top-right gear, then **Hide chat**.
+            This version should click **Hide chat**, wait for the popup, then click **Yes, Hide**.
             """
         )
 
@@ -1132,7 +1194,7 @@ if generate:
         st.download_button(
             label="Download script as .js",
             data=script,
-            file_name="reddit_selected_chat_delete_hide_gear.js",
+            file_name="reddit_selected_chat_delete_hide_yes_hide_deleted_fix.js",
             mime="text/javascript",
             use_container_width=True
         )
