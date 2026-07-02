@@ -49,7 +49,7 @@ no_progress_rounds = st.slider(
 hide_after_delete = st.checkbox(
     "Hide selected chats after cleaning",
     value=True,
-    help="After deleting your sent messages in a selected chat, the script will click the top-right gear, then Hide chat, then Yes, Hide."
+    help="After cleaning, the script will click the top-right gear, then Hide chat, then Yes, Hide."
 )
 
 generate = st.button(
@@ -60,15 +60,11 @@ generate = st.button(
 
 JS_TEMPLATE = r"""
 // Reddit Selected-Chat Own-Message Bulk Delete + Hide
-// Shows a checkbox picker first.
-// Deletes only YOUR sent messages in selected chats.
-// Retries failed visible messages until they disappear or the safety limit is reached.
-// Hides chats by clicking the top-right gear, then Hide chat, then Yes, Hide.
-// Handles [deleted] chat rows if Reddit shows them in the sidebar.
-// Uses visual sidebar scanning to catch more visible chats.
+// Fix version: aggressive sidebar row detection for [deleted] chats.
+// Deletes only YOUR sent chat messages.
 // Does NOT delete comments.
 // Does NOT delete posts.
-// Run on any Reddit chat page where the left chat sidebar is visible.
+// Hides selected chats through gear -> Hide chat -> Yes, Hide.
 
 (async () => {
   const USERNAME = __USERNAME_JSON__;
@@ -94,7 +90,7 @@ JS_TEMPLATE = r"""
     value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
   const sidebarRight = () => {
-    return Math.min(390, Math.max(260, window.innerWidth * 0.38));
+    return Math.min(430, Math.max(285, window.innerWidth * 0.40));
   };
 
   const deepNodes = function* (root = document) {
@@ -222,6 +218,29 @@ JS_TEMPLATE = r"""
     return true;
   };
 
+  const clickRowByCoordinates = (rowEl) => {
+    if (!rowEl || !isVisible(rowEl)) return false;
+
+    const r = rowEl.getBoundingClientRect();
+
+    const x = Math.min(
+      Math.max(r.left + 55, 20),
+      Math.min(r.right - 10, sidebarRight() - 10)
+    );
+
+    const y = r.top + r.height / 2;
+
+    const pointEl = document.elementFromPoint(x, y);
+
+    if (pointEl) {
+      clickElementOrClickableAncestor(pointEl);
+      return true;
+    }
+
+    clickElementOrClickableAncestor(rowEl);
+    return true;
+  };
+
   const findVisibleByText = (selectors, regex) => {
     return deepQueryAll(selectors)
       .filter(isVisible)
@@ -232,35 +251,26 @@ JS_TEMPLATE = r"""
   };
 
   const isBadSidebarText = (text) => {
-    return /create|settings|logout|advertise|premium|popular|home|all|notifications|explore|search|close|back|help|privacy|terms|reddit recap|communities|custom feeds|threads$|select reddit chats|delete\/hide selected chats|hide after cleaning|select all|select none/i.test(
-      text
-    );
-  };
+    const cleaned = normalizeTextForMatch(text);
 
-  const looksLikeSidebarChatText = (text) => {
-    const cleaned = cleanText(text);
+    if (!cleaned) return true;
 
-    if (!cleaned || cleaned.length < 2) return false;
-    if (isBadSidebarText(cleaned)) return false;
-
-    return (
-      cleaned.includes("You:") ||
-      cleaned.includes("[deleted]") ||
-      /yesterday|today|jun|jul|aug|sep|oct|nov|dec|jan|feb|mar|apr|may|\d{1,2}:\d{2}\s?(am|pm)?/i.test(cleaned) ||
-      /^[a-z0-9_.-]{3,40}$/i.test(cleaned)
-    );
+    return /^(chats|threads|select reddit chats to clean|select all|select none|cancel|delete\/hide selected chats)$/.test(cleaned) ||
+      /create|settings|logout|advertise|premium|popular|home|all|notifications|explore|search|close|back|help|privacy|terms|reddit recap|communities|custom feeds|hide after cleaning/i.test(cleaned);
   };
 
   const isSidebarRowRect = (r) => {
     return (
-      r.left >= 0 &&
-      r.left < sidebarRight() &&
-      r.width >= 90 &&
+      r.left >= -5 &&
+      r.left < 90 &&
+      r.right > 160 &&
+      r.right <= sidebarRight() + 60 &&
+      r.width >= 150 &&
       r.width <= sidebarRight() + 80 &&
-      r.height >= 24 &&
-      r.height <= 145 &&
-      r.top > 80 &&
-      r.bottom < window.innerHeight + 20
+      r.height >= 38 &&
+      r.height <= 92 &&
+      r.top >= 105 &&
+      r.bottom <= window.innerHeight + 8
     );
   };
 
@@ -276,6 +286,16 @@ JS_TEMPLATE = r"""
     return null;
   };
 
+  const rowTextLooksPossible = (text) => {
+    const cleaned = cleanText(text);
+
+    if (!cleaned || cleaned.length < 2) return false;
+    if (cleaned.length > 320) return false;
+    if (isBadSidebarText(cleaned)) return false;
+
+    return true;
+  };
+
   const scorePossibleChatRow = (el) => {
     if (!el || !isVisible(el)) return -Infinity;
 
@@ -283,26 +303,25 @@ JS_TEMPLATE = r"""
     const text = cleanText(getReadableText(el));
 
     if (!isSidebarRowRect(r)) return -Infinity;
-    if (!looksLikeSidebarChatText(text)) return -Infinity;
-
-    let score = 0;
-
-    score += Math.min(r.width, 340) * 3;
-    score += Math.min(r.height, 90) * 2;
-
-    if (getElementHref(el)) score += 200;
-    if (text.includes("[deleted]")) score += 160;
-    if (text.includes("You:")) score += 120;
-    if (/yesterday|today|jun|jul|aug|sep|oct|nov|dec|jan|feb|mar|apr|may|\d{1,2}:\d{2}\s?(am|pm)?/i.test(text)) score += 80;
+    if (!rowTextLooksPossible(text)) return -Infinity;
 
     const tag = el.tagName?.toLowerCase() || "";
     const role = el.getAttribute?.("role") || "";
 
-    if (tag === "button" || tag === "a") score += 80;
-    if (role === "button" || role === "link" || role === "listitem" || role === "option") score += 80;
+    let score = 0;
 
-    if (text.length > 260) score -= 150;
-    if (r.height > 120) score -= 80;
+    score += Math.min(r.width, 360) * 4;
+    score += Math.min(r.height, 90) * 4;
+
+    if (getElementHref(el)) score += 250;
+    if (text.includes("[deleted]")) score += 500;
+    if (text.includes("You:")) score += 200;
+    if (/yesterday|today|jun|jul|aug|sep|oct|nov|dec|jan|feb|mar|apr|may|\d{1,2}:\d{2}\s?(am|pm)?/i.test(text)) score += 160;
+
+    if (tag === "button" || tag === "a") score += 120;
+    if (role === "button" || role === "link" || role === "listitem" || role === "option") score += 120;
+
+    if (text.length > 240) score -= 40;
 
     return score;
   };
@@ -313,7 +332,7 @@ JS_TEMPLATE = r"""
     let bestScore = -Infinity;
     let depth = 0;
 
-    while (el && el !== document.body && depth < 12) {
+    while (el && el !== document.body && depth < 16) {
       const score = scorePossibleChatRow(el);
 
       if (score > bestScore) {
@@ -328,15 +347,39 @@ JS_TEMPLATE = r"""
     return bestScore > -Infinity ? best : null;
   };
 
+  const scanSidebarRowsFromAllElements = () => {
+    const out = [];
+
+    for (const el of deepNodes(document)) {
+      if (!(el instanceof Element)) continue;
+      if (!isVisible(el)) continue;
+
+      const r = el.getBoundingClientRect();
+
+      if (
+        r.left < sidebarRight() &&
+        r.right > 10 &&
+        r.top >= 90 &&
+        r.bottom <= window.innerHeight + 20
+      ) {
+        const row = bestSidebarRowFromElement(el);
+
+        if (row) out.push(row);
+      }
+    }
+
+    return out;
+  };
+
   const scanSidebarRowsByScreenPosition = () => {
     const found = [];
     const seen = new Set();
 
-    const maxX = Math.min(sidebarRight() - 15, 340);
-    const sampleXs = [28, 55, 90, 135, 185, 235, 275, 320]
+    const maxX = Math.min(sidebarRight() - 12, 360);
+    const sampleXs = [12, 24, 40, 58, 78, 105, 135, 170, 210, 250, 285, 320, 350]
       .filter((x) => x > 0 && x < maxX);
 
-    for (let y = 90; y < window.innerHeight - 8; y += 8) {
+    for (let y = 105; y < window.innerHeight - 5; y += 5) {
       for (const x of sampleXs) {
         const pointEl = document.elementFromPoint(x, y);
         if (!pointEl) continue;
@@ -347,7 +390,7 @@ JS_TEMPLATE = r"""
         const r = row.getBoundingClientRect();
         const text = cleanText(getReadableText(row));
 
-        const key = `${Math.round(r.top)}:${Math.round(r.left)}:${Math.round(r.width)}:${Math.round(r.height)}:${text.slice(0, 60)}`;
+        const key = `${Math.round(r.top)}:${Math.round(r.left)}:${Math.round(r.width)}:${Math.round(r.height)}:${text.slice(0, 80)}`;
 
         if (seen.has(key)) continue;
 
@@ -357,28 +400,6 @@ JS_TEMPLATE = r"""
     }
 
     return found;
-  };
-
-  const scanSidebarRowsBySelectors = () => {
-    const selectors = [
-      'a[href*="chat"]',
-      'a[href*="channel"]',
-      'a[href*="room"]',
-      '[role="link"]',
-      '[role="listitem"]',
-      '[role="option"]',
-      'rs-list-item',
-      'rs-room-list-item',
-      'rs-conversation-list-item',
-      'button',
-      'a',
-      'div'
-    ].join(",");
-
-    return deepQueryAll(selectors)
-      .filter(isVisible)
-      .map((el) => bestSidebarRowFromElement(el))
-      .filter(Boolean);
   };
 
   const groupRowsByVisualPosition = (rawRows) => {
@@ -406,9 +427,9 @@ JS_TEMPLATE = r"""
         const smallerHeight = Math.min(group.bottom - group.top, r.height);
 
         const overlapsSameRow =
-          smallerHeight > 0 && overlap / smallerHeight > 0.35;
+          smallerHeight > 0 && overlap / smallerHeight > 0.30;
 
-        const closeCenter = Math.abs(group.centerY - centerY) < 28;
+        const closeCenter = Math.abs(group.centerY - centerY) < 26;
 
         return overlapsSameRow || closeCenter;
       });
@@ -442,16 +463,16 @@ JS_TEMPLATE = r"""
   };
 
   const getChatCandidates = () => {
-    const pointRows = scanSidebarRowsByScreenPosition();
-    const selectorRows = scanSidebarRowsBySelectors();
+    const rowsFromPoints = scanSidebarRowsByScreenPosition();
+    const rowsFromElements = scanSidebarRowsFromAllElements();
 
     const bestRows = groupRowsByVisualPosition([
-      ...pointRows,
-      ...selectorRows
+      ...rowsFromPoints,
+      ...rowsFromElements
     ]);
 
     const unique = [];
-    const seenKeys = new Set();
+    const seenRowKeys = new Set();
     const duplicateCounter = new Map();
 
     for (const item of bestRows) {
@@ -459,21 +480,21 @@ JS_TEMPLATE = r"""
       const r = item.rect;
 
       const href = getElementHref(el);
-      const text = cleanText(getReadableText(el)).slice(0, 240);
+      const text = cleanText(getReadableText(el)).slice(0, 280);
       const normalizedText = normalizeTextForMatch(text);
 
-      if (!text || text.length < 2) continue;
-      if (isBadSidebarText(text)) continue;
+      if (!rowTextLooksPossible(text)) continue;
+
+      const geometryKey = `${Math.round(r.top)}:${Math.round(r.left)}:${Math.round(r.width)}:${Math.round(r.height)}`;
+
+      if (seenRowKeys.has(geometryKey)) continue;
+      seenRowKeys.add(geometryKey);
 
       const currentDupIndex = duplicateCounter.get(normalizedText) || 0;
       duplicateCounter.set(normalizedText, currentDupIndex + 1);
 
-      const geometryKey = `${Math.round(r.top)}:${Math.round(r.left)}:${Math.round(r.width)}:${Math.round(r.height)}`;
       const baseKey = href || normalizedText || text;
       const key = href || `${baseKey}::row${unique.length}::${geometryKey}`;
-
-      if (seenKeys.has(key)) continue;
-      seenKeys.add(key);
 
       let displayText = text || href || "[unknown chat]";
 
@@ -492,12 +513,18 @@ JS_TEMPLATE = r"""
         duplicateIndex: currentDupIndex,
         href,
         top: Math.round(r.top),
+        bottom: Math.round(r.bottom),
         left: Math.round(r.left),
+        right: Math.round(r.right),
         width: Math.round(r.width),
         height: Math.round(r.height),
+        clickX: Math.round(Math.min(Math.max(r.left + 55, 20), Math.min(r.right - 10, sidebarRight() - 10))),
+        clickY: Math.round(r.top + r.height / 2),
         element: el
       });
     }
+
+    unique.sort((a, b) => a.top - b.top);
 
     console.log(
       "Detected chat candidates:",
@@ -506,11 +533,13 @@ JS_TEMPLATE = r"""
         text: chat.text,
         rawText: chat.rawText,
         href: chat.href,
-        duplicateIndex: chat.duplicateIndex,
         top: chat.top,
+        bottom: chat.bottom,
         left: chat.left,
         width: chat.width,
-        height: chat.height
+        height: chat.height,
+        clickX: chat.clickX,
+        clickY: chat.clickY
       }))
     );
 
@@ -568,17 +597,9 @@ JS_TEMPLATE = r"""
     while (Date.now() - started < GONE_CHECK_TIMEOUT_MS) {
       await sleep(GONE_CHECK_INTERVAL_MS);
 
-      if (!document.contains(eventEl)) {
-        return true;
-      }
-
-      if (!isVisible(eventEl)) {
-        return true;
-      }
-
-      if (!isOwnMessage(eventEl)) {
-        return true;
-      }
+      if (!document.contains(eventEl)) return true;
+      if (!isVisible(eventEl)) return true;
+      if (!isOwnMessage(eventEl)) return true;
     }
 
     return false;
@@ -624,18 +645,14 @@ JS_TEMPLATE = r"""
         ].join(",")
       );
 
-      if (!more || !isVisible(more)) {
-        return false;
-      }
+      if (!more || !isVisible(more)) return false;
 
       more.click();
       await sleep(MENU_DELAY_MS);
 
       const deleteItem = findDeleteMenuItem();
 
-      if (!deleteItem) {
-        return false;
-      }
+      if (!deleteItem) return false;
 
       deleteItem.click();
     }
@@ -643,9 +660,7 @@ JS_TEMPLATE = r"""
     await confirmDeleteDialog();
     await sleep(DELETE_DELAY_MS);
 
-    const gone = await waitUntilMessageGone(eventEl);
-
-    return gone;
+    return await waitUntilMessageGone(eventEl);
   };
 
   const getOwnMessageEvents = () =>
@@ -775,9 +790,7 @@ JS_TEMPLATE = r"""
       ].join(",")
     ).filter(isVisible);
 
-    if (possibleBackButtons.length === 0) {
-      return false;
-    }
+    if (possibleBackButtons.length === 0) return false;
 
     possibleBackButtons[0].click();
     await sleep(SIDEBAR_RECOVERY_DELAY_MS);
@@ -798,9 +811,7 @@ JS_TEMPLATE = r"""
   const returnToChatListIfNeeded = async () => {
     let chats = getChatCandidates();
 
-    if (chats.length > 0) {
-      return true;
-    }
+    if (chats.length > 0) return true;
 
     console.warn("Chat list is not visible. Trying to return to the chat list...");
 
@@ -818,10 +829,7 @@ JS_TEMPLATE = r"""
       return true;
     }
 
-    console.warn(
-      "Still cannot see the chat list. Widen the Reddit window or undock DevTools, then run again."
-    );
-
+    console.warn("Still cannot see the chat list. Widen the Reddit window or undock DevTools, then run again.");
     return false;
   };
 
@@ -840,6 +848,16 @@ JS_TEMPLATE = r"""
       match = candidates.find((chat) => chat.key === savedChat.key);
     }
 
+    if (!match && savedChat.top != null) {
+      match = candidates
+        .map((chat) => ({
+          chat,
+          distance: Math.abs(chat.top - savedChat.top)
+        }))
+        .filter((x) => x.distance < 18)
+        .sort((a, b) => a.distance - b.distance)[0]?.chat || null;
+    }
+
     if (!match && savedChat.rawText) {
       const savedRaw = normalizeTextForMatch(savedChat.rawText);
 
@@ -850,20 +868,6 @@ JS_TEMPLATE = r"""
           currentRaw === savedRaw ||
           currentRaw.includes(savedRaw) ||
           savedRaw.includes(currentRaw)
-        );
-      });
-    }
-
-    if (!match && savedChat.text) {
-      const savedDisplay = normalizeTextForMatch(savedChat.text);
-
-      match = candidates.find((chat) => {
-        const currentDisplay = normalizeTextForMatch(chat.text);
-
-        return (
-          currentDisplay === savedDisplay ||
-          currentDisplay.includes(savedDisplay) ||
-          savedDisplay.includes(currentDisplay)
         );
       });
     }
@@ -882,23 +886,35 @@ JS_TEMPLATE = r"""
   };
 
   const clickChat = async (savedChat) => {
-    const chatEl = await findChatElementFromSavedChat(savedChat);
+    let chatEl = await findChatElementFromSavedChat(savedChat);
 
-    if (!chatEl) {
-      console.warn(`Could not find chat again: ${savedChat.text || savedChat.rawText || savedChat.key}`);
-      return false;
+    if (chatEl) {
+      chatEl.scrollIntoView({ block: "center" });
+      await sleep(250);
+
+      console.log(`Opening selected chat: ${savedChat.text || savedChat.rawText || savedChat.key}`);
+
+      clickRowByCoordinates(chatEl);
+
+      await sleep(CHAT_SWITCH_DELAY_MS);
+
+      return true;
     }
 
-    chatEl.scrollIntoView({ block: "center" });
-    await sleep(300);
+    if (savedChat.clickX != null && savedChat.clickY != null) {
+      console.warn("Could not rematch by text/row. Trying saved screen coordinates...");
 
-    console.log(`Opening selected chat: ${savedChat.text || savedChat.rawText || savedChat.key}`);
+      const pointEl = document.elementFromPoint(savedChat.clickX, savedChat.clickY);
 
-    clickElementOrClickableAncestor(chatEl);
+      if (pointEl) {
+        clickElementOrClickableAncestor(pointEl);
+        await sleep(CHAT_SWITCH_DELAY_MS);
+        return true;
+      }
+    }
 
-    await sleep(CHAT_SWITCH_DELAY_MS);
-
-    return true;
+    console.warn(`Could not find chat again: ${savedChat.text || savedChat.rawText || savedChat.key}`);
+    return false;
   };
 
   const clickConfirmHideIfNeeded = async () => {
@@ -907,7 +923,7 @@ JS_TEMPLATE = r"""
     const started = Date.now();
     let sawPopup = false;
 
-    while (Date.now() - started < 6000) {
+    while (Date.now() - started < 7000) {
       await sleep(250);
 
       const bodyText = cleanText(document.body.innerText).toLowerCase();
@@ -942,7 +958,7 @@ JS_TEMPLATE = r"""
         return true;
       }
 
-      if (!sawPopup && Date.now() - started > 2500 && !bodyText.includes("hide chat?")) {
+      if (!sawPopup && Date.now() - started > 3000 && !bodyText.includes("hide chat?")) {
         console.log("No Hide chat confirmation popup detected. Assuming no confirmation was needed.");
         return true;
       }
@@ -1008,11 +1024,11 @@ JS_TEMPLATE = r"""
 
         return (
           r.top >= 0 &&
-          r.top < 80 &&
+          r.top < 85 &&
           r.left > sidebarRight() &&
-          r.right > window.innerWidth - 160 &&
-          r.width >= 16 &&
-          r.height >= 16
+          r.right > window.innerWidth - 175 &&
+          r.width >= 14 &&
+          r.height >= 14
         );
       })
       .sort((a, b) => {
@@ -1113,7 +1129,7 @@ JS_TEMPLATE = r"""
       overlay.style.fontFamily = "Arial, sans-serif";
 
       const panel = document.createElement("div");
-      panel.style.width = "min(820px, 92vw)";
+      panel.style.width = "min(860px, 92vw)";
       panel.style.maxHeight = "82vh";
       panel.style.overflow = "auto";
       panel.style.background = "#fff";
@@ -1130,9 +1146,8 @@ JS_TEMPLATE = r"""
         </p>
 
         <p style="margin:0 0 12px;font-size:13px;line-height:1.4;color:#555;">
-          This version scans the visible left sidebar by screen position, so it should catch normal chats,
-          [deleted] chats, and rows with no preview text. If a chat is missing, cancel this popup, scroll the left
-          Reddit chat sidebar to load more chats, then run the script again.
+          This version aggressively scans the visible left sidebar and should include <b>[deleted]</b> rows.
+          If a chat is missing, cancel, scroll the Reddit chat sidebar to load more, then run again.
         </p>
 
         <p style="margin:0 0 12px;font-size:13px;line-height:1.4;color:#555;">
@@ -1215,7 +1230,11 @@ JS_TEMPLATE = r"""
           rawText: chats[i].rawText,
           normalizedText: chats[i].normalizedText,
           duplicateIndex: chats[i].duplicateIndex,
-          href: chats[i].href
+          href: chats[i].href,
+          top: chats[i].top,
+          bottom: chats[i].bottom,
+          clickX: chats[i].clickX,
+          clickY: chats[i].clickY
         }));
 
         closeWith(selected);
@@ -1225,19 +1244,23 @@ JS_TEMPLATE = r"""
 
   console.log("Scanning visible chats...");
   console.log("Current URL:", location.href);
-  console.log("Tip: this version scans the visible sidebar by screen position.");
-  console.log("Tip: [deleted] chat rows are included if Reddit renders them in the sidebar.");
+  console.log("Tip: this version aggressively scans the visible sidebar for [deleted] rows.");
   console.log("Tip: scroll the left chat sidebar before running if you want more chats to appear.");
   console.log("Tip: if only one chat processes, undock DevTools or widen the Reddit window.");
   console.log(`Retry settings: ${MAX_RETRY_ROUNDS_PER_CHAT} retry rounds per chat, stop after ${MAX_NO_PROGRESS_ROUNDS} no-progress rounds.`);
   console.log(`Hide after delete: ${HIDE_AFTER_DELETE ? "ON" : "OFF"}`);
 
-  const selectedChats = await showChatPicker();
+  const selectedChatsRaw = await showChatPicker();
 
-  if (!selectedChats.length) {
+  if (!selectedChatsRaw.length) {
     console.log("No chats selected. Cancelled.");
     return;
   }
+
+  // If hiding is on, process from bottom to top so hiding a lower row does not shift rows above it.
+  const selectedChats = HIDE_AFTER_DELETE
+    ? [...selectedChatsRaw].sort((a, b) => (b.top ?? 0) - (a.top ?? 0))
+    : selectedChatsRaw;
 
   console.log(`Selected ${selectedChats.length} chat(s).`);
   console.log(`Speed: up to ${MAX_DELETES_PER_MINUTE} deletes per minute.`);
@@ -1324,17 +1347,15 @@ if generate:
             **How to use it:**
 
             1. Open Reddit Chat.
-            2. It is okay if Reddit redirects you to a specific chat/channel URL.
-            3. Make sure the left chat sidebar is visible.
-            4. For best results, undock DevTools or make the Reddit window wide.
-            5. Scroll the left chat sidebar until the chats you want are loaded.
-            6. Open DevTools.
-            7. Go to the **Console** tab.
-            8. Paste the generated script.
-            9. Select the chats in the popup.
-            10. Click **Delete/hide selected chats**.
+            2. Make sure the left chat sidebar is visible.
+            3. Scroll the left sidebar until the chats you want are visible.
+            4. Open DevTools.
+            5. Go to the **Console** tab.
+            6. Paste the generated script.
+            7. Select the chats in the popup.
+            8. Click **Delete/hide selected chats**.
 
-            This version scans the visible sidebar by screen position, so it should catch more visible chats, including `[deleted]` rows.
+            This version aggressively scans the visible sidebar for `[deleted]` rows and processes selected chats from bottom to top when hiding is enabled.
             """
         )
 
@@ -1343,7 +1364,7 @@ if generate:
         st.download_button(
             label="Download script as .js",
             data=script,
-            file_name="reddit_selected_chat_delete_hide_visual_scan.js",
+            file_name="reddit_selected_chat_delete_hide_deleted_aggressive_scan.js",
             mime="text/javascript",
             use_container_width=True
         )
