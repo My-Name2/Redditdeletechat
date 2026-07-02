@@ -24,15 +24,15 @@ speed = st.slider(
     "Max deletes per minute",
     min_value=20,
     max_value=150,
-    value=70,
+    value=90,
     step=10
 )
 
 retry_rounds = st.slider(
     "Max retry rounds per chat",
-    min_value=3,
-    max_value=30,
-    value=10,
+    min_value=2,
+    max_value=20,
+    value=8,
     step=1,
     help="The script will keep retrying visible failed messages until they disappear or this limit is reached."
 )
@@ -40,7 +40,7 @@ retry_rounds = st.slider(
 no_progress_rounds = st.slider(
     "Stop after this many no-progress rounds",
     min_value=2,
-    max_value=10,
+    max_value=8,
     value=3,
     step=1,
     help="Stops a chat if Reddit refuses to delete messages repeatedly."
@@ -60,14 +60,13 @@ generate = st.button(
 
 JS_TEMPLATE = r"""
 // Reddit Selected-Chat Own-Message Bulk Delete + Hide
-// Fixed version:
-// - Does not count a delete until the Yes, Delete modal is actually confirmed.
-// - Does not try to hide unless the chat actually opened.
-// - Handles Hide chat -> Yes, Hide.
-// - Scans visible sidebar rows, including [deleted] rows.
+// Faster hide-fix version:
 // - Deletes only YOUR sent Reddit chat messages.
 // - Does NOT delete Reddit comments.
 // - Does NOT delete Reddit posts.
+// - Scans the visible sidebar, including [deleted] rows.
+// - Opens selected chats, deletes visible own messages, then hides via gear -> Hide chat -> Yes, Hide.
+// - Faster modal handling than the previous version.
 
 (async () => {
   const USERNAME = __USERNAME_JSON__;
@@ -77,15 +76,16 @@ JS_TEMPLATE = r"""
   const HIDE_AFTER_DELETE = __HIDE_AFTER_DELETE__;
 
   const DELETE_DELAY_MS = Math.ceil(60000 / MAX_DELETES_PER_MINUTE);
-  const SHORT_DELAY_MS = 120;
-  const MENU_DELAY_MS = 200;
-  const CONFIRM_DELAY_MS = 250;
-  const SCROLL_DELAY_MS = 700;
-  const CHAT_SWITCH_DELAY_MS = 1600;
-  const SIDEBAR_RECOVERY_DELAY_MS = 1300;
-  const HIDE_DELAY_MS = 1800;
-  const GONE_CHECK_TIMEOUT_MS = 3500;
-  const GONE_CHECK_INTERVAL_MS = 180;
+  const SHORT_DELAY_MS = 90;
+  const MENU_DELAY_MS = 130;
+  const CONFIRM_DELAY_MS = 120;
+  const SCROLL_DELAY_MS = 450;
+  const CHAT_SWITCH_DELAY_MS = 1000;
+  const SIDEBAR_RECOVERY_DELAY_MS = 700;
+  const HIDE_DELAY_MS = 750;
+  const GONE_CHECK_TIMEOUT_MS = 2200;
+  const GONE_CHECK_INTERVAL_MS = 120;
+  const MODAL_WAIT_MS = 3500;
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -279,6 +279,50 @@ JS_TEMPLATE = r"""
     }
 
     return true;
+  };
+
+  const clickCenter = (el) => {
+    if (!el || !isVisible(el)) return false;
+    const r = el.getBoundingClientRect();
+    return clickAt(r.left + r.width / 2, r.top + r.height / 2);
+  };
+
+  const clickRowLikeElement = (el) => {
+    if (!el || !isVisible(el)) return false;
+
+    let current = el;
+    let best = el;
+    let bestScore = -Infinity;
+    let depth = 0;
+
+    while (current && current !== document.body && depth < 8) {
+      const r = current.getBoundingClientRect();
+      let score = 0;
+
+      if (r.width >= 140) score += 50;
+      if (r.height >= 24 && r.height <= 90) score += 50;
+      if (r.left > sidebarRight() || r.right > sidebarRight()) score += 25;
+      if (isVisible(current)) score += 10;
+
+      if (score > bestScore) {
+        bestScore = score;
+        best = current;
+      }
+
+      current = current.parentElement || current.getRootNode?.()?.host || null;
+      depth++;
+    }
+
+    const r = best.getBoundingClientRect();
+
+    const x = Math.min(
+      Math.max(r.left + Math.min(90, r.width / 2), r.left + 8),
+      r.right - 8
+    );
+
+    const y = r.top + r.height / 2;
+
+    return clickAt(x, y) || clickCenter(el) || clickElementOrClickableAncestor(el);
   };
 
   const clickRowByCoordinates = (rowEl, savedChat = null) => {
@@ -710,21 +754,23 @@ JS_TEMPLATE = r"""
     return unique;
   };
 
+  const bodyTextNormalized = () => normalizeTextForMatch(document.body.innerText);
+
   const isDeleteMessageModalOpen = () => {
-    return normalizeTextForMatch(document.body.innerText).includes("delete this message?");
+    return bodyTextNormalized().includes("delete this message?");
   };
 
   const isHideChatModalOpen = () => {
-    return normalizeTextForMatch(document.body.innerText).includes("hide chat?");
+    return bodyTextNormalized().includes("hide chat?");
   };
 
   const clickModalAction = async ({ modalTextRegex, actionTextRegex, actionName }) => {
     const started = Date.now();
 
-    while (Date.now() - started < 8000) {
-      await sleep(250);
+    while (Date.now() - started < MODAL_WAIT_MS) {
+      await sleep(100);
 
-      const bodyText = normalizeTextForMatch(document.body.innerText);
+      const bodyText = bodyTextNormalized();
       const modalOpen = modalTextRegex.test(bodyText);
 
       const buttons = deepQueryAll("button, [role='button'], rs-button")
@@ -747,9 +793,9 @@ JS_TEMPLATE = r"""
             const r = item.r;
 
             return (
-              r.width >= 40 &&
-              r.height >= 24 &&
-              r.top > 200 &&
+              r.width >= 38 &&
+              r.height >= 22 &&
+              r.top > 180 &&
               !/^x$|^close$|^cancel$/i.test(text)
             );
           })
@@ -763,28 +809,18 @@ JS_TEMPLATE = r"""
 
       if (target) {
         console.log(`Clicking modal action: ${actionName}`);
-        clickElementOrClickableAncestor(target.button);
+        clickCenter(target.button) || clickElementOrClickableAncestor(target.button);
 
-        await sleep(900);
+        await sleep(450);
 
-        const afterText = normalizeTextForMatch(document.body.innerText);
-
-        if (!modalTextRegex.test(afterText)) {
-          return true;
-        }
-
-        await sleep(900);
-
-        const afterText2 = normalizeTextForMatch(document.body.innerText);
-
-        if (!modalTextRegex.test(afterText2)) {
+        if (!modalTextRegex.test(bodyTextNormalized())) {
           return true;
         }
 
         return false;
       }
 
-      if (!modalOpen && Date.now() - started > 2500) {
+      if (!modalOpen && Date.now() - started > 1000) {
         return false;
       }
     }
@@ -805,9 +841,7 @@ JS_TEMPLATE = r"""
   };
 
   const clickConfirmHideIfNeeded = async () => {
-    if (!isHideChatModalOpen()) {
-      await sleep(500);
-    }
+    await sleep(150);
 
     if (!isHideChatModalOpen()) {
       console.log("No Hide chat confirmation popup detected.");
@@ -871,8 +905,8 @@ JS_TEMPLATE = r"""
       });
 
     if (closeButton) {
-      clickElementOrClickableAncestor(closeButton);
-      await sleep(500);
+      clickCenter(closeButton) || clickElementOrClickableAncestor(closeButton);
+      await sleep(250);
     }
   };
 
@@ -904,7 +938,7 @@ JS_TEMPLATE = r"""
     );
 
     if (directDelete && isVisible(directDelete)) {
-      directDelete.click();
+      clickCenter(directDelete) || directDelete.click();
     } else {
       const more = localQuery(
         eventEl,
@@ -920,14 +954,14 @@ JS_TEMPLATE = r"""
 
       if (!more || !isVisible(more)) return false;
 
-      more.click();
+      clickCenter(more) || more.click();
       await sleep(MENU_DELAY_MS);
 
       const deleteItem = findDeleteMenuItem();
 
       if (!deleteItem) return false;
 
-      deleteItem.click();
+      clickRowLikeElement(deleteItem);
     }
 
     const confirmed = await confirmDeleteDialog();
@@ -1045,21 +1079,23 @@ JS_TEMPLATE = r"""
       lastRemainingCount = remaining;
 
       if (noProgressRounds >= MAX_NO_PROGRESS_ROUNDS) {
-        console.warn(
-          "Stopping this chat because repeated retry rounds made no progress."
-        );
+        console.warn("Stopping this chat because repeated retry rounds made no progress.");
         break;
       }
 
-      await sleep(1000);
+      await sleep(600);
     }
 
     return { deleted, failed };
   };
 
   const isWelcomeScreen = () => {
-    const bodyText = normalizeTextForMatch(document.body.innerText);
-    return bodyText.includes("welcome to chat") && bodyText.includes("start a direct or group chat");
+    const text = bodyTextNormalized();
+    return text.includes("welcome to chat") && text.includes("start a direct or group chat");
+  };
+
+  const isChatSettingsScreen = () => {
+    return bodyTextNormalized().includes("chat settings") && bodyTextNormalized().includes("hide chat");
   };
 
   const findChatSettingsGear = () => {
@@ -1117,16 +1153,16 @@ JS_TEMPLATE = r"""
   const waitForChatOpen = async () => {
     const started = Date.now();
 
-    while (Date.now() - started < 5000) {
-      await sleep(250);
+    while (Date.now() - started < 3500) {
+      await sleep(180);
 
       if (!isWelcomeScreen() && findChatSettingsGear()) {
         return true;
       }
 
-      const bodyText = normalizeTextForMatch(document.body.innerText);
+      const text = bodyTextNormalized();
 
-      if (!isWelcomeScreen() && bodyText.includes("message")) {
+      if (!isWelcomeScreen() && (text.includes("message") || text.includes(USERNAME.toLowerCase()))) {
         return true;
       }
     }
@@ -1149,7 +1185,7 @@ JS_TEMPLATE = r"""
 
     if (possibleBackButtons.length === 0) return false;
 
-    possibleBackButtons[0].click();
+    clickCenter(possibleBackButtons[0]) || possibleBackButtons[0].click();
     await sleep(SIDEBAR_RECOVERY_DELAY_MS);
 
     return getChatCandidates().length > 0;
@@ -1245,12 +1281,12 @@ JS_TEMPLATE = r"""
   const clickChat = async (savedChat) => {
     console.log(`Opening selected chat: ${savedChat.text || savedChat.rawText || savedChat.key}`);
 
-    for (let attempt = 1; attempt <= 3; attempt++) {
+    for (let attempt = 1; attempt <= 2; attempt++) {
       const chatEl = await findChatElementFromSavedChat(savedChat);
 
       if (chatEl) {
         chatEl.scrollIntoView({ block: "center" });
-        await sleep(250);
+        await sleep(180);
         clickRowByCoordinates(chatEl, savedChat);
       } else if (savedChat.clickX != null && savedChat.clickY != null) {
         console.warn(`Could not rematch row on attempt ${attempt}. Trying saved coordinates...`);
@@ -1268,7 +1304,7 @@ JS_TEMPLATE = r"""
       }
 
       console.warn(`Chat did not open on attempt ${attempt}. Retrying...`);
-      await sleep(700);
+      await sleep(400);
     }
 
     console.warn(`Could not open chat after retries: ${savedChat.text || savedChat.rawText || savedChat.key}`);
@@ -1283,12 +1319,7 @@ JS_TEMPLATE = r"""
       return false;
     }
 
-    const alreadySettings = findVisibleByText(
-      ['h1', 'h2', 'h3', 'div', 'span'].join(","),
-      /^chat settings$/i
-    );
-
-    if (alreadySettings) {
+    if (isChatSettingsScreen()) {
       console.log("Already on Chat settings screen.");
       return true;
     }
@@ -1296,12 +1327,20 @@ JS_TEMPLATE = r"""
     const gear = findChatSettingsGear();
 
     if (gear) {
-      clickElementOrClickableAncestor(gear);
-      await sleep(900);
-      return true;
+      clickCenter(gear) || clickElementOrClickableAncestor(gear);
+      await sleep(450);
+
+      if (isChatSettingsScreen()) return true;
     }
 
-    console.warn("Could not find the top-right chat settings gear.");
+    // Coordinate fallback for the top-right gear.
+    // This is faster and more reliable on Reddit's current chat layout.
+    clickAt(window.innerWidth - 24, 24);
+    await sleep(550);
+
+    if (isChatSettingsScreen()) return true;
+
+    console.warn("Could not find/open the top-right chat settings gear.");
     return false;
   };
 
@@ -1318,10 +1357,46 @@ JS_TEMPLATE = r"""
       ].join(",")
     ).filter(isVisible);
 
+    const exact = candidates.find((el) => {
+      const text = cleanText(getReadableText(el));
+      return /^hide chat$/i.test(text);
+    });
+
+    if (exact) return exact;
+
     return candidates.find((el) => {
       const text = cleanText(getReadableText(el));
-      return /^hide chat$/i.test(text) || /^hide$/i.test(text);
+      return /^hide$/i.test(text);
     });
+  };
+
+  const clickHideChatButton = async () => {
+    const hideButton = findHideChatButton();
+
+    if (!hideButton) {
+      console.warn("Could not find Hide chat on the settings screen.");
+      return false;
+    }
+
+    console.log("Clicking Hide chat...");
+
+    // Try the row click first, then exact center click.
+    clickRowLikeElement(hideButton);
+    await sleep(250);
+
+    if (isHideChatModalOpen()) return true;
+
+    clickCenter(hideButton) || clickElementOrClickableAncestor(hideButton);
+    await sleep(250);
+
+    if (isHideChatModalOpen()) return true;
+
+    // Coordinate fallback based on the Hide chat text location.
+    const r = hideButton.getBoundingClientRect();
+    clickAt(Math.max(r.left + 10, sidebarRight() + 70), r.top + r.height / 2);
+    await sleep(250);
+
+    return isHideChatModalOpen();
   };
 
   const hideCurrentChat = async () => {
@@ -1339,17 +1414,12 @@ JS_TEMPLATE = r"""
       return false;
     }
 
-    await sleep(800);
+    const clickedHide = await clickHideChatButton();
 
-    const hideButton = findHideChatButton();
-
-    if (!hideButton) {
-      console.warn("Could not find Hide chat on the settings screen.");
+    if (!clickedHide) {
+      console.warn("Hide chat button was found but did not open the confirmation popup.");
       return false;
     }
-
-    console.log("Clicking Hide chat...");
-    clickElementOrClickableAncestor(hideButton);
 
     const confirmed = await clickConfirmHideIfNeeded();
 
@@ -1358,7 +1428,7 @@ JS_TEMPLATE = r"""
       return false;
     }
 
-    await sleep(1800);
+    await sleep(HIDE_DELAY_MS);
 
     console.log("Hide chat confirmed.");
     return true;
@@ -1408,8 +1478,8 @@ JS_TEMPLATE = r"""
         </p>
 
         <p style="margin:0 0 12px;font-size:13px;line-height:1.4;color:#555;">
-          This version verifies the chat actually opens before deleting/hiding, and it waits for
-          <b>Yes, Delete</b> / <b>Yes, Hide</b> popups before moving on.
+          Faster hide-fix version: opens selected chat, confirms Yes/Delete, then gear → Hide chat → Yes, Hide.
+          If a chat is missing, cancel, scroll the Reddit chat sidebar to load more, then run again.
         </p>
 
         <p style="margin:0 0 12px;font-size:13px;line-height:1.4;color:#555;">
@@ -1505,7 +1575,7 @@ JS_TEMPLATE = r"""
 
   console.log("Scanning visible chats...");
   console.log("Current URL:", location.href);
-  console.log("Tip: this version verifies chats open and waits for modal confirmations.");
+  console.log("Tip: faster hide-fix version. It should be faster than the previous modal-safe version.");
   console.log("Tip: scroll the left chat sidebar before running if you want more chats to appear.");
   console.log("Tip: if only one chat processes, undock DevTools or widen the Reddit window.");
   console.log(`Retry settings: ${MAX_RETRY_ROUNDS_PER_CHAT} retry rounds per chat, stop after ${MAX_NO_PROGRESS_ROUNDS} no-progress rounds.`);
@@ -1565,7 +1635,7 @@ JS_TEMPLATE = r"""
         console.warn(`Could not hide chat: ${chat.text}`);
       }
 
-      await sleep(1200);
+      await sleep(500);
     }
 
     await returnToChatListIfNeeded();
@@ -1622,7 +1692,7 @@ if generate:
             7. Select the chats in the popup.
             8. Click **Delete/hide selected chats**.
 
-            This version should stop the repeated fake “deleted” count and should not try to hide a chat unless it actually opens first.
+            This faster version improves Hide chat clicking and avoids the slow repeated modal checks from the prior version.
             """
         )
 
@@ -1631,7 +1701,7 @@ if generate:
         st.download_button(
             label="Download script as .js",
             data=script,
-            file_name="reddit_selected_chat_delete_hide_confirmed_modal_fix.js",
+            file_name="reddit_selected_chat_delete_hide_faster_hide_fix.js",
             mime="text/javascript",
             use_container_width=True
         )
