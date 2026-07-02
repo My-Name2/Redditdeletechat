@@ -2,12 +2,12 @@ import json
 import streamlit as st
 
 st.set_page_config(
-    page_title="Reddit Single Chat Delete/Hide Script Generator",
+    page_title="Reddit Single Chat Auto Delete/Hide",
     page_icon="🧹",
     layout="centered"
 )
 
-st.title("Reddit Single Chat Delete/Hide Script Generator")
+st.title("Reddit Single Chat Auto Delete/Hide")
 st.caption("Generate a script for ONE already-open Reddit chat, then paste it into Reddit's DevTools Console.")
 
 st.warning(
@@ -17,21 +17,18 @@ st.warning(
 
 st.markdown(
     """
-    **Use this simpler version when you want to test one chat at a time.**
+    **Use this for one chat at a time.**
 
     1. Open the exact Reddit chat you want to clean.
-    2. Make sure you are not on the **Welcome to chat** screen.
+    2. Make sure the chat is open, not the **Welcome to chat** screen.
     3. Generate the script below.
     4. Paste it into DevTools → Console on Reddit.
-    5. It deletes only your sent chat messages in that open chat.
-    6. Then it can hide that same open chat.
+    5. It deletes only your sent chat messages.
+    6. It then automatically hides that same chat.
     """
 )
 
-username = st.text_input(
-    "Reddit username",
-    placeholder="without u/"
-)
+username = st.text_input("Reddit username", placeholder="without u/")
 
 speed = st.slider(
     "Max deletes per minute",
@@ -69,28 +66,23 @@ max_empty_scroll_rounds = st.slider(
 )
 
 hide_after_delete = st.checkbox(
-    "Hide this open chat after delete pass",
+    "Automatically hide this open chat after delete pass",
     value=True
 )
 
-ask_before_hide = st.checkbox(
-    "Ask before hiding",
-    value=True,
-    help="Shows a browser confirm popup after the delete pass before hiding the chat."
-)
-
 generate = st.button(
-    "Generate single-chat script",
+    "Generate single-chat auto script",
     type="primary",
     use_container_width=True
 )
 
-JS_TEMPLATE = r"""// Reddit SINGLE Open-Chat Own-Message Delete + Hide
-// Use this simpler version for ONE chat only.
+JS_TEMPLATE = r"""
+// Reddit SINGLE Open-Chat Own-Message Delete + Automatic Hide
+// Use this simple version for ONE chat only.
 // 1. Open the Reddit chat you want to clean.
 // 2. Paste this whole script into DevTools Console.
 // 3. It deletes only YOUR sent chat messages that Reddit allows deleting.
-// 4. Then it hides the currently open chat through Gear -> Hide chat -> Yes, Hide.
+// 4. Then it automatically hides the currently open chat through Gear -> Hide chat -> Yes, Hide.
 // It does NOT delete Reddit comments.
 // It does NOT delete Reddit posts.
 // Stop anytime by typing this in the console:
@@ -105,7 +97,6 @@ JS_TEMPLATE = r"""// Reddit SINGLE Open-Chat Own-Message Delete + Hide
   const MAX_NO_PROGRESS_ATTEMPTS = __MAX_NO_PROGRESS_ATTEMPTS__;
   const MAX_EMPTY_SCROLL_ROUNDS = __MAX_EMPTY_SCROLL_ROUNDS__;
   const HIDE_AFTER_DELETE = __HIDE_AFTER_DELETE__;
-  const ASK_BEFORE_HIDE = __ASK_BEFORE_HIDE__;
 
   const SHORT_DELAY_MS = 150;
   const MENU_DELAY_MS = 250;
@@ -277,6 +268,12 @@ JS_TEMPLATE = r"""// Reddit SINGLE Open-Chat Own-Message Delete + Hide
     return Math.min(440, Math.max(285, window.innerWidth * 0.42));
   };
 
+  const findVisibleByText = (selector, regex) => {
+    return deepQueryAll(selector)
+      .filter(isVisible)
+      .find((el) => regex.test(cleanText(getReadableText(el))));
+  };
+
   const getVisiblePageTextDeep = () => {
     try {
       const deepText = deepQueryAll(
@@ -323,7 +320,28 @@ JS_TEMPLATE = r"""// Reddit SINGLE Open-Chat Own-Message Delete + Hide
     );
   };
 
-  const clickModalAction = async ({ modalName, modalOpenCheck, actionRegex }) => {
+  const getVisibleButtons = () => {
+    return deepQueryAll("button, [role='button'], rs-button")
+      .filter(isVisible)
+      .map((button) => {
+        const r = button.getBoundingClientRect();
+
+        let background = "";
+
+        try {
+          background = getComputedStyle(button).backgroundColor || "";
+        } catch {}
+
+        return {
+          button,
+          text: normalizeText(getReadableText(button)),
+          r,
+          background
+        };
+      });
+  };
+
+  const clickModalAction = async ({ modalName, modalOpenCheck, exactActionRegex, looseActionRegex }) => {
     console.log(`Waiting for ${modalName} popup...`);
 
     const started = Date.now();
@@ -332,30 +350,15 @@ JS_TEMPLATE = r"""// Reddit SINGLE Open-Chat Own-Message Delete + Hide
       await sleep(250);
 
       const modalOpen = modalOpenCheck();
+      const buttons = getVisibleButtons();
 
-      const buttons = deepQueryAll("button, [role='button'], rs-button")
-        .filter(isVisible)
-        .map((button) => {
-          const r = button.getBoundingClientRect();
-
-          let background = "";
-
-          try {
-            background = getComputedStyle(button).backgroundColor || "";
-          } catch {}
-
-          return {
-            button,
-            text: normalizeText(getReadableText(button)),
-            r,
-            background
-          };
-        });
-
-      let target = buttons.find((item) => actionRegex.test(item.text));
+      // Important:
+      // Prefer exact "Yes, Delete" / "Yes, Hide" buttons.
+      // Do NOT click a plain "delete" menu item while the modal is open.
+      let target = buttons.find((item) => exactActionRegex.test(item.text));
 
       if (!target && modalOpen) {
-        const likelyActionButtons = buttons
+        const modalButtons = buttons
           .filter((item) => {
             const text = item.text;
             const r = item.r;
@@ -369,19 +372,19 @@ JS_TEMPLATE = r"""// Reddit SINGLE Open-Chat Own-Message Delete + Hide
             );
           })
           .sort((a, b) => {
-            const aActionText = /yes|delete|hide/.test(a.text) ? 5000 : 0;
-            const bActionText = /yes|delete|hide/.test(b.text) ? 5000 : 0;
+            const aLoose = looseActionRegex.test(a.text) ? 5000 : 0;
+            const bLoose = looseActionRegex.test(b.text) ? 5000 : 0;
 
-            const aDark = /rgb\(0,\s*0,\s*0\)|rgba\(0,\s*0,\s*0/i.test(a.background) ? 1000 : 0;
-            const bDark = /rgb\(0,\s*0,\s*0\)|rgba\(0,\s*0,\s*0/i.test(b.background) ? 1000 : 0;
+            const aDark = /rgb\(0,\s*0,\s*0\)|rgba\(0,\s*0,\s*0/i.test(a.background) ? 1200 : 0;
+            const bDark = /rgb\(0,\s*0,\s*0\)|rgba\(0,\s*0,\s*0/i.test(b.background) ? 1200 : 0;
 
-            const aScore = aActionText + aDark + a.r.right + a.r.bottom * 0.1;
-            const bScore = bActionText + bDark + b.r.right + b.r.bottom * 0.1;
+            const aScore = aLoose + aDark + a.r.right + a.r.bottom * 0.1;
+            const bScore = bLoose + bDark + b.r.right + b.r.bottom * 0.1;
 
             return bScore - aScore;
           });
 
-        target = likelyActionButtons[0];
+        target = modalButtons[0];
       }
 
       if (target) {
@@ -418,7 +421,8 @@ JS_TEMPLATE = r"""// Reddit SINGLE Open-Chat Own-Message Delete + Hide
     return await clickModalAction({
       modalName: "Delete message",
       modalOpenCheck: isDeleteMessageModalOpen,
-      actionRegex: /^yes,\s*delete$|^yes\s*delete$|^delete$/i
+      exactActionRegex: /^yes,\s*delete$|^yes\s*delete$/i,
+      looseActionRegex: /yes|delete/i
     });
   };
 
@@ -426,7 +430,8 @@ JS_TEMPLATE = r"""// Reddit SINGLE Open-Chat Own-Message Delete + Hide
     return await clickModalAction({
       modalName: "Hide chat",
       modalOpenCheck: isHideChatModalOpen,
-      actionRegex: /^yes,\s*hide$|^yes\s*hide$|^hide$/i
+      exactActionRegex: /^yes,\s*hide$|^yes\s*hide$/i,
+      looseActionRegex: /yes|hide/i
     });
   };
 
@@ -435,12 +440,11 @@ JS_TEMPLATE = r"""// Reddit SINGLE Open-Chat Own-Message Delete + Hide
 
     console.warn("Delete popup is still open. Closing it before continuing...");
 
-    const closeButton = deepQueryAll("button, [role='button']")
-      .filter(isVisible)
-      .find((button) => {
-        const text = normalizeText(getReadableText(button));
+    const closeButton = getVisibleButtons()
+      .find((item) => {
+        const text = item.text;
         return text === "cancel" || text === "x" || text === "close";
-      });
+      })?.button;
 
     if (closeButton) {
       clickElementOrClickableAncestor(closeButton);
@@ -673,7 +677,6 @@ JS_TEMPLATE = r"""// Reddit SINGLE Open-Chat Own-Message Delete + Hide
       if (refreshedMessages.length === 0) continue;
 
       // Delete one message at a time, then re-scan.
-      // Bottom-most visible message tends to be the least disruptive in Reddit chat.
       const targetMessage = refreshedMessages[refreshedMessages.length - 1];
 
       totalAttempts++;
@@ -888,22 +891,11 @@ JS_TEMPLATE = r"""// Reddit SINGLE Open-Chat Own-Message Delete + Hide
   }
 
   if (!HIDE_AFTER_DELETE) {
-    console.log("Hide step disabled in Streamlit settings.");
+    console.log("Automatic hide disabled in Streamlit settings.");
     return;
   }
 
-  let shouldHide = true;
-
-  if (ASK_BEFORE_HIDE) {
-    shouldHide = confirm(
-      `Delete pass finished.\n\nDeleted: ${deleteResult.deleted}\nFailed/skipped: ${deleteResult.failed}\n\nHide this chat now?`
-    );
-  }
-
-  if (!shouldHide) {
-    console.log("Hide cancelled by user.");
-    return;
-  }
+  console.log("Automatic hide is enabled. Hiding this chat now...");
 
   const hidden = await hideCurrentChat();
 
@@ -927,7 +919,6 @@ if generate:
             .replace("__MAX_NO_PROGRESS_ATTEMPTS__", str(int(max_no_progress_attempts)))
             .replace("__MAX_EMPTY_SCROLL_ROUNDS__", str(int(max_empty_scroll_rounds)))
             .replace("__HIDE_AFTER_DELETE__", "true" if hide_after_delete else "false")
-            .replace("__ASK_BEFORE_HIDE__", "true" if ask_before_hide else "false")
             .strip()
         )
 
@@ -956,9 +947,9 @@ if generate:
         st.download_button(
             label="Download generated script as .js",
             data=script,
-            file_name="reddit_single_open_chat_delete_hide.js",
+            file_name="reddit_single_open_chat_auto_delete_hide.js",
             mime="text/javascript",
             use_container_width=True
         )
 else:
-    st.info("Enter your username and click the button to generate the single-chat script.")
+    st.info("Enter your username and click the button to generate the single-chat auto script.")
