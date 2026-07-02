@@ -2,88 +2,120 @@ import json
 import streamlit as st
 
 st.set_page_config(
-    page_title="Reddit Chat Delete/Hide Script Generator",
+    page_title="Reddit Single Chat Delete/Hide Script Generator",
     page_icon="🧹",
     layout="centered"
 )
 
-st.title("Reddit Chat Delete/Hide Script Generator")
-st.caption("Generate a selected-chat delete/hide script, then paste it into Reddit's DevTools Console.")
+st.title("Reddit Single Chat Delete/Hide Script Generator")
+st.caption("Generate a script for ONE already-open Reddit chat, then paste it into Reddit's DevTools Console.")
 
 st.warning(
-    "Hosted Streamlit apps cannot directly control reddit.com in your browser. "
-    "This app generates JavaScript that you paste into the Console on a Reddit chat page."
+    "Hosted Streamlit apps cannot directly control reddit.com. "
+    "This app generates JavaScript that you paste into the Console on an already-open Reddit chat."
 )
 
-username = st.text_input("Reddit username", placeholder="without u/")
+st.markdown(
+    """
+    **Use this simpler version when you want to test one chat at a time.**
+
+    1. Open the exact Reddit chat you want to clean.
+    2. Make sure you are not on the **Welcome to chat** screen.
+    3. Generate the script below.
+    4. Paste it into DevTools → Console on Reddit.
+    5. It deletes only your sent chat messages in that open chat.
+    6. Then it can hide that same open chat.
+    """
+)
+
+username = st.text_input(
+    "Reddit username",
+    placeholder="without u/"
+)
 
 speed = st.slider(
     "Max deletes per minute",
     min_value=20,
     max_value=120,
-    value=60,
-    step=10
+    value=45,
+    step=5,
+    help="Slower is safer. Try 35–60 if Reddit popups lag."
 )
 
-retry_rounds = st.slider(
-    "Max retry rounds per chat",
+max_total_attempts = st.slider(
+    "Max total delete attempts",
+    min_value=25,
+    max_value=1000,
+    value=500,
+    step=25
+)
+
+max_no_progress_attempts = st.slider(
+    "Stop after this many failed/no-progress delete attempts",
+    min_value=1,
+    max_value=20,
+    value=5,
+    step=1,
+    help="Stops if Reddit keeps showing the same message or popups do not confirm."
+)
+
+max_empty_scroll_rounds = st.slider(
+    "Stop after this many empty upward scroll rounds",
     min_value=2,
     max_value=20,
-    value=6,
+    value=8,
     step=1,
-    help="The script retries messages that remain visible after a delete attempt."
-)
-
-no_progress_rounds = st.slider(
-    "Stop after this many no-progress rounds",
-    min_value=1,
-    max_value=6,
-    value=2,
-    step=1,
-    help="Stops a chat if the same visible message refuses to delete."
+    help="The script scrolls upward to look for older messages. This controls when it gives up."
 )
 
 hide_after_delete = st.checkbox(
-    "Hide selected chats after cleaning",
+    "Hide this open chat after delete pass",
+    value=True
+)
+
+ask_before_hide = st.checkbox(
+    "Ask before hiding",
     value=True,
-    help="After cleaning, the script will click the top-right gear, then Hide chat, then Yes, Hide."
+    help="Shows a browser confirm popup after the delete pass before hiding the chat."
 )
 
 generate = st.button(
-    "Generate selected-chat delete/hide script",
+    "Generate single-chat script",
     type="primary",
     use_container_width=True
 )
 
-JS_TEMPLATE = r"""
-// Reddit Selected-Chat Own-Message Delete + Hide
-// Important fix in this version:
-// - It will NOT count a message as deleted just because the DOM re-rendered.
-// - It waits for the "Delete this message?" popup to close.
-// - It verifies the same message signature is gone before counting success.
-// - It closes a stuck delete popup before moving to hide.
-// - It does not try to hide unless the chat actually opened.
-// - Deletes only YOUR sent Reddit chat messages.
-// - Does NOT delete Reddit comments.
-// - Does NOT delete Reddit posts.
+JS_TEMPLATE = r"""// Reddit SINGLE Open-Chat Own-Message Delete + Hide
+// Use this simpler version for ONE chat only.
+// 1. Open the Reddit chat you want to clean.
+// 2. Paste this whole script into DevTools Console.
+// 3. It deletes only YOUR sent chat messages that Reddit allows deleting.
+// 4. Then it hides the currently open chat through Gear -> Hide chat -> Yes, Hide.
+// It does NOT delete Reddit comments.
+// It does NOT delete Reddit posts.
+// Stop anytime by typing this in the console:
+// window.__redditSingleChatCleanupStop = true
 
 (async () => {
   const USERNAME = __USERNAME_JSON__;
   const MAX_DELETES_PER_MINUTE = __MAX_DELETES__;
-  const MAX_RETRY_ROUNDS_PER_CHAT = __MAX_RETRY_ROUNDS__;
-  const MAX_NO_PROGRESS_ROUNDS = __MAX_NO_PROGRESS_ROUNDS__;
-  const HIDE_AFTER_DELETE = __HIDE_AFTER_DELETE__;
-
   const DELETE_DELAY_MS = Math.ceil(60000 / MAX_DELETES_PER_MINUTE);
-  const SHORT_DELAY_MS = 120;
-  const MENU_DELAY_MS = 220;
-  const SCROLL_DELAY_MS = 700;
-  const CHAT_SWITCH_DELAY_MS = 1500;
-  const SIDEBAR_RECOVERY_DELAY_MS = 1100;
+
+  const MAX_TOTAL_DELETE_ATTEMPTS = __MAX_TOTAL_DELETE_ATTEMPTS__;
+  const MAX_NO_PROGRESS_ATTEMPTS = __MAX_NO_PROGRESS_ATTEMPTS__;
+  const MAX_EMPTY_SCROLL_ROUNDS = __MAX_EMPTY_SCROLL_ROUNDS__;
+  const HIDE_AFTER_DELETE = __HIDE_AFTER_DELETE__;
+  const ASK_BEFORE_HIDE = __ASK_BEFORE_HIDE__;
+
+  const SHORT_DELAY_MS = 150;
+  const MENU_DELAY_MS = 250;
+  const SCROLL_DELAY_MS = 850;
+  const CONFIRM_TIMEOUT_MS = 10000;
+  const GONE_TIMEOUT_MS = 5500;
+  const GONE_INTERVAL_MS = 250;
   const HIDE_DELAY_MS = 1300;
-  const CONFIRM_TIMEOUT_MS = 9000;
-  const GONE_CHECK_TIMEOUT_MS = 4500;
-  const GONE_CHECK_INTERVAL_MS = 200;
+
+  window.__redditSingleChatCleanupStop = false;
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -105,14 +137,14 @@ JS_TEMPLATE = r"""
     }
   };
 
-  const escapeRegExp = (value) =>
-    safeString(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
   const cleanText = (text) =>
     safeString(text).replace(/\s+/g, " ").trim();
 
   const normalizeText = (text) =>
     cleanText(text).toLowerCase();
+
+  const escapeRegExp = (value) =>
+    safeString(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
   const getAttributeSafe = (el, name) => {
     try {
@@ -131,9 +163,6 @@ JS_TEMPLATE = r"""
       return "";
     }
   };
-
-  const sidebarRight = () =>
-    Math.min(440, Math.max(285, window.innerWidth * 0.42));
 
   const deepNodes = function* (root = document) {
     yield root;
@@ -228,11 +257,6 @@ JS_TEMPLATE = r"""
     return values.find((v) => cleanText(v))?.trim() || "";
   };
 
-  const getElementHref = (el) => {
-    const link = localQuery(el, "a");
-    return getHrefSafe(el) || getHrefSafe(link) || "";
-  };
-
   const clickElementOrClickableAncestor = (el) => {
     if (!el) return false;
 
@@ -249,441 +273,13 @@ JS_TEMPLATE = r"""
     return true;
   };
 
-  const clickAt = (x, y) => {
-    const el = document.elementFromPoint(x, y);
-    if (!el) return false;
-
-    try {
-      el.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, cancelable: true, clientX: x, clientY: y }));
-      el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, clientX: x, clientY: y }));
-      el.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, cancelable: true, clientX: x, clientY: y }));
-      el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, clientX: x, clientY: y }));
-      el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, clientX: x, clientY: y }));
-    } catch {
-      clickElementOrClickableAncestor(el);
-    }
-
-    return true;
+  const sidebarRight = () => {
+    return Math.min(440, Math.max(285, window.innerWidth * 0.42));
   };
 
-  const clickRowByCoordinates = (rowEl, savedChat = null) => {
-    if (!rowEl && savedChat?.clickX != null && savedChat?.clickY != null) {
-      return clickAt(savedChat.clickX, savedChat.clickY);
-    }
-
-    if (!rowEl || !isVisible(rowEl)) return false;
-
-    const r = rowEl.getBoundingClientRect();
-
-    const points = [
-      [Math.min(Math.max(r.left + 54, 18), Math.min(r.right - 10, sidebarRight() - 10)), r.top + r.height / 2],
-      [Math.min(Math.max(r.left + 115, 18), Math.min(r.right - 10, sidebarRight() - 10)), r.top + r.height / 2],
-      [Math.min(Math.max(r.left + 190, 18), Math.min(r.right - 10, sidebarRight() - 10)), r.top + r.height / 2]
-    ];
-
-    for (const [x, y] of points) {
-      if (clickAt(x, y)) return true;
-    }
-
-    return clickElementOrClickableAncestor(rowEl);
-  };
-
-  const findVisibleByText = (selectors, regex) =>
-    deepQueryAll(selectors)
-      .filter(isVisible)
-      .find((el) => regex.test(cleanText(getReadableText(el))));
-
-  const getParentElementAcrossShadow = (el) => {
-    if (!el) return null;
-    if (el.parentElement) return el.parentElement;
-
-    const root = el.getRootNode?.();
-    if (root && root.host) return root.host;
-
-    return null;
-  };
-
-  const isBadSidebarText = (text) => {
-    const cleaned = normalizeText(text);
-
-    if (!cleaned) return true;
-
-    if (
-      /^(chats|threads|select reddit chats to clean|select all|select none|cancel|delete\/hide selected chats|delete selected chats)$/.test(cleaned)
-    ) {
-      return true;
-    }
-
-    return /create|settings|logout|advertise|premium|popular|home|all|notifications|explore|search|close|back|help|privacy|terms|reddit recap|communities|custom feeds|hide after cleaning|found \d+ visible chat/i.test(cleaned);
-  };
-
-  const isCandidateSidebarRect = (r) => (
-    r.top >= 32 &&
-    r.bottom <= window.innerHeight + 20 &&
-    r.left >= -8 &&
-    r.left < sidebarRight() &&
-    r.right > 70 &&
-    r.right <= sidebarRight() + 80 &&
-    r.width >= 45 &&
-    r.width <= sidebarRight() + 95 &&
-    r.height >= 16 &&
-    r.height <= 115
-  );
-
-  const isPreferredRowRect = (r) => (
-    r.left >= -8 &&
-    r.left <= 42 &&
-    r.right >= 180 &&
-    r.right <= sidebarRight() + 80 &&
-    r.width >= 175 &&
-    r.height >= 38 &&
-    r.height <= 100 &&
-    r.top >= 32 &&
-    r.bottom <= window.innerHeight + 20
-  );
-
-  const collectTextInsideRect = (rect) => {
-    const fragments = [];
-
-    for (const node of deepNodes(document)) {
-      if (!(node instanceof Element)) continue;
-      if (!isVisible(node)) continue;
-
-      const r = node.getBoundingClientRect();
-
-      const verticalOverlap =
-        Math.max(0, Math.min(rect.bottom, r.bottom) - Math.max(rect.top, r.top));
-
-      const horizontalOverlap =
-        Math.max(0, Math.min(sidebarRight() + 10, r.right) - Math.max(0, r.left));
-
-      if (verticalOverlap <= 0 || horizontalOverlap <= 0) continue;
-      if (r.left < -5 || r.left > sidebarRight()) continue;
-      if (r.width > sidebarRight() + 80) continue;
-      if (r.height > 130) continue;
-
-      const text = cleanText(
-        safeString(node.innerText) ||
-        safeString(node.textContent) ||
-        getAttributeSafe(node, "aria-label") ||
-        getAttributeSafe(node, "title")
-      );
-
-      if (!text || text.length > 240) continue;
-      if (isBadSidebarText(text)) continue;
-
-      fragments.push({
-        text,
-        top: r.top,
-        left: r.left
-      });
-    }
-
-    const unique = [];
-    const seen = new Set();
-
-    for (const item of fragments.sort((a, b) => {
-      if (Math.abs(a.top - b.top) > 4) return a.top - b.top;
-      return a.left - b.left;
-    })) {
-      const key = normalizeText(item.text);
-
-      if (!key || seen.has(key)) continue;
-
-      seen.add(key);
-      unique.push(item.text);
-    }
-
-    return cleanText(unique.join(" "));
-  };
-
-  const scorePossibleChatRow = (el) => {
-    if (!el || !isVisible(el)) return -Infinity;
-
-    const r = el.getBoundingClientRect();
-    if (!isCandidateSidebarRect(r)) return -Infinity;
-
-    const ownText = cleanText(getReadableText(el));
-    const rectText = collectTextInsideRect(r);
-    const text = cleanText(`${ownText} ${rectText}`);
-
-    if (!text || isBadSidebarText(text)) return -Infinity;
-
-    const tag = safeString(el.tagName).toLowerCase();
-    const role = getAttributeSafe(el, "role");
-
-    let score = 0;
-
-    if (isPreferredRowRect(r)) score += 900;
-
-    score += Math.min(r.width, 380) * 3;
-    score += Math.min(r.height, 95) * 5;
-
-    if (getElementHref(el)) score += 250;
-    if (text.includes("[deleted]")) score += 1200;
-    if (text.includes("You:")) score += 350;
-
-    if (/yesterday|today|jun|jul|aug|sep|oct|nov|dec|jan|feb|mar|apr|may|\d{1,2}:\d{2}\s?(am|pm)?/i.test(text)) {
-      score += 250;
-    }
-
-    if (tag === "button" || tag === "a") score += 130;
-    if (role === "button" || role === "link" || role === "listitem" || role === "option") score += 130;
-
-    if (r.left > 65) score -= 300;
-    if (text.length > 260) score -= 40;
-
-    return score;
-  };
-
-  const bestSidebarRowFromElement = (startEl) => {
-    let el = startEl;
-    let best = null;
-    let bestScore = -Infinity;
-    let depth = 0;
-
-    while (el && el !== document.body && depth < 22) {
-      const score = scorePossibleChatRow(el);
-
-      if (score > bestScore) {
-        best = el;
-        bestScore = score;
-      }
-
-      el = getParentElementAcrossShadow(el);
-      depth++;
-    }
-
-    return bestScore > -Infinity ? best : null;
-  };
-
-  const scanSidebarRowsByAllElements = () => {
-    const rows = [];
-
-    for (const node of deepNodes(document)) {
-      if (!(node instanceof Element)) continue;
-      if (!isVisible(node)) continue;
-
-      const r = node.getBoundingClientRect();
-
-      if (
-        r.left < sidebarRight() &&
-        r.right > 8 &&
-        r.top >= 30 &&
-        r.bottom <= window.innerHeight + 25
-      ) {
-        const best = bestSidebarRowFromElement(node);
-        if (best) rows.push(best);
-      }
-    }
-
-    return rows;
-  };
-
-  const scanSidebarRowsByScreenPoints = () => {
-    const rows = [];
-    const seen = new Set();
-
-    const maxX = Math.min(sidebarRight() - 8, 395);
-
-    const sampleXs = [
-      8, 16, 24, 34, 44, 54, 66, 82, 100, 124, 150,
-      180, 210, 240, 270, 305, 340, 375
-    ].filter((x) => x > 0 && x < maxX);
-
-    for (let y = 34; y < window.innerHeight - 4; y += 4) {
-      for (const x of sampleXs) {
-        const pointEl = document.elementFromPoint(x, y);
-        if (!pointEl) continue;
-
-        const row = bestSidebarRowFromElement(pointEl);
-        if (!row) continue;
-
-        const r = row.getBoundingClientRect();
-        const key = `${Math.round(r.top)}:${Math.round(r.left)}:${Math.round(r.width)}:${Math.round(r.height)}`;
-
-        if (seen.has(key)) continue;
-
-        seen.add(key);
-        rows.push(row);
-      }
-    }
-
-    return rows;
-  };
-
-  const makeFallbackRowsFromVisibleText = () => {
-    const rows = [];
-
-    for (const node of deepNodes(document)) {
-      if (!(node instanceof Element)) continue;
-      if (!isVisible(node)) continue;
-
-      const r = node.getBoundingClientRect();
-
-      if (
-        r.top < 32 ||
-        r.bottom > window.innerHeight + 20 ||
-        r.left < -5 ||
-        r.left > sidebarRight() ||
-        r.right < 75 ||
-        r.width > sidebarRight() + 70
-      ) {
-        continue;
-      }
-
-      const text = cleanText(getReadableText(node));
-      if (!text || isBadSidebarText(text)) continue;
-
-      if (
-        text.includes("[deleted]") ||
-        text.includes("You:") ||
-        /yesterday|today|jun|jul|aug|sep|oct|nov|dec|jan|feb|mar|apr|may|\d{1,2}:\d{2}\s?(am|pm)?/i.test(text)
-      ) {
-        const row = bestSidebarRowFromElement(node) || node;
-        rows.push(row);
-      }
-    }
-
-    return rows;
-  };
-
-  const groupRowsByVisualPosition = (rawRows) => {
-    const sorted = [...new Set(rawRows)]
-      .filter(isVisible)
-      .sort((a, b) => {
-        const ar = a.getBoundingClientRect();
-        const br = b.getBoundingClientRect();
-
-        if (Math.abs(ar.top - br.top) > 6) return ar.top - br.top;
-        return ar.left - br.left;
-      });
-
-    const groups = [];
-
-    for (const el of sorted) {
-      const r = el.getBoundingClientRect();
-      const centerY = r.top + r.height / 2;
-
-      const existing = groups.find((group) => {
-        const overlapTop = Math.max(group.top, r.top);
-        const overlapBottom = Math.min(group.bottom, r.bottom);
-        const overlap = Math.max(0, overlapBottom - overlapTop);
-        const smallerHeight = Math.min(group.bottom - group.top, r.height);
-
-        const overlaps =
-          smallerHeight > 0 && overlap / smallerHeight > 0.28;
-
-        const closeCenter = Math.abs(group.centerY - centerY) < 24;
-
-        return overlaps || closeCenter;
-      });
-
-      const candidate = {
-        el,
-        rect: r,
-        score: scorePossibleChatRow(el)
-      };
-
-      if (existing) {
-        existing.items.push(candidate);
-        existing.top = Math.min(existing.top, r.top);
-        existing.bottom = Math.max(existing.bottom, r.bottom);
-        existing.centerY = (existing.top + existing.bottom) / 2;
-      } else {
-        groups.push({
-          top: r.top,
-          bottom: r.bottom,
-          centerY,
-          items: [candidate]
-        });
-      }
-    }
-
-    return groups.map((group) => {
-      return group.items.sort((a, b) => b.score - a.score)[0];
-    });
-  };
-
-  const getChatCandidates = () => {
-    const rows = [
-      ...scanSidebarRowsByScreenPoints(),
-      ...scanSidebarRowsByAllElements(),
-      ...makeFallbackRowsFromVisibleText()
-    ];
-
-    const bestRows = groupRowsByVisualPosition(rows);
-
-    const unique = [];
-    const seenTopBands = new Set();
-
-    for (const item of bestRows) {
-      const el = item.el;
-      const r = item.rect;
-
-      const rowText = collectTextInsideRect(r);
-      const ownText = getReadableText(el);
-      const href = getElementHref(el);
-
-      let text = cleanText(rowText || ownText || href);
-
-      if (!text || isBadSidebarText(text)) continue;
-
-      const topBand = Math.round(r.top / 6);
-      if (seenTopBands.has(topBand)) continue;
-      seenTopBands.add(topBand);
-
-      const normalizedText = normalizeText(text);
-      const geometryKey = `${Math.round(r.top)}:${Math.round(r.left)}:${Math.round(r.width)}:${Math.round(r.height)}`;
-      const key = href || `${normalizedText || text}::${geometryKey}`;
-
-      if (normalizedText.includes("[deleted]")) {
-        text = `[deleted chat] ${text}`;
-      }
-
-      unique.push({
-        key,
-        text,
-        rawText: text,
-        normalizedText,
-        href,
-        top: Math.round(r.top),
-        bottom: Math.round(r.bottom),
-        left: Math.round(r.left),
-        right: Math.round(r.right),
-        width: Math.round(r.width),
-        height: Math.round(r.height),
-        clickX: Math.round(Math.min(Math.max(r.left + 54, 18), Math.min(r.right - 10, sidebarRight() - 10))),
-        clickY: Math.round(r.top + r.height / 2),
-        element: el
-      });
-    }
-
-    unique.sort((a, b) => a.top - b.top);
-
-    console.log(
-      "Detected chat candidates:",
-      unique.map((chat, i) => ({
-        number: i + 1,
-        text: chat.text,
-        top: chat.top,
-        bottom: chat.bottom,
-        left: chat.left,
-        right: chat.right,
-        width: chat.width,
-        height: chat.height,
-        clickX: chat.clickX,
-        clickY: chat.clickY
-      }))
-    );
-
-    return unique;
-  };
-
-  
   const getVisiblePageTextDeep = () => {
     try {
-      const text = deepQueryAll(
+      const deepText = deepQueryAll(
         [
           "dialog",
           "[role='dialog']",
@@ -705,34 +301,43 @@ JS_TEMPLATE = r"""
         .filter(Boolean)
         .join(" ");
 
-      return normalizeText(`${document.body.innerText || ""} ${text}`);
+      return normalizeText(`${document.body.innerText || ""} ${deepText}`);
     } catch {
       return normalizeText(document.body.innerText || "");
     }
   };
-  const isDeleteMessageModalOpen = () =>
-    getVisiblePageTextDeep().includes("delete this message?");
 
-  const isHideChatModalOpen = () =>
-    getVisiblePageTextDeep().includes("hide chat?");
+  const isDeleteMessageModalOpen = () => {
+    const text = getVisiblePageTextDeep();
+    return (
+      text.includes("delete this message?") ||
+      text.includes("it will be removed for everyone in this chat")
+    );
+  };
 
-  const clickModalAction = async ({ modalTextRegex, actionTextRegex, actionName }) => {
+  const isHideChatModalOpen = () => {
+    const text = getVisiblePageTextDeep();
+    return (
+      text.includes("hide chat?") ||
+      text.includes("this conversation will be hidden")
+    );
+  };
+
+  const clickModalAction = async ({ modalName, modalOpenCheck, actionRegex }) => {
+    console.log(`Waiting for ${modalName} popup...`);
+
     const started = Date.now();
 
     while (Date.now() - started < CONFIRM_TIMEOUT_MS) {
       await sleep(250);
 
-      const visibleText = getVisiblePageTextDeep();
-      const modalOpen = modalTextRegex.test(visibleText);
-
-      if (!modalOpen && Date.now() - started > 1200) {
-        return false;
-      }
+      const modalOpen = modalOpenCheck();
 
       const buttons = deepQueryAll("button, [role='button'], rs-button")
         .filter(isVisible)
         .map((button) => {
           const r = button.getBoundingClientRect();
+
           let background = "";
 
           try {
@@ -747,10 +352,10 @@ JS_TEMPLATE = r"""
           };
         });
 
-      let target = buttons.find((item) => actionTextRegex.test(item.text));
+      let target = buttons.find((item) => actionRegex.test(item.text));
 
       if (!target && modalOpen) {
-        const modalButtons = buttons
+        const likelyActionButtons = buttons
           .filter((item) => {
             const text = item.text;
             const r = item.r;
@@ -758,14 +363,14 @@ JS_TEMPLATE = r"""
             return (
               r.width >= 40 &&
               r.height >= 24 &&
-              r.top > 140 &&
+              r.top > 120 &&
               r.bottom < window.innerHeight &&
               !/^x$|^close$|^cancel$/i.test(text)
             );
           })
           .sort((a, b) => {
-            const aActionText = /yes|delete|hide/.test(a.text) ? 4000 : 0;
-            const bActionText = /yes|delete|hide/.test(b.text) ? 4000 : 0;
+            const aActionText = /yes|delete|hide/.test(a.text) ? 5000 : 0;
+            const bActionText = /yes|delete|hide/.test(b.text) ? 5000 : 0;
 
             const aDark = /rgb\(0,\s*0,\s*0\)|rgba\(0,\s*0,\s*0/i.test(a.background) ? 1000 : 0;
             const bDark = /rgb\(0,\s*0,\s*0\)|rgba\(0,\s*0,\s*0/i.test(b.background) ? 1000 : 0;
@@ -776,183 +381,71 @@ JS_TEMPLATE = r"""
             return bScore - aScore;
           });
 
-        target = modalButtons[0];
+        target = likelyActionButtons[0];
       }
 
       if (target) {
-        console.log(`Clicking modal action: ${actionName}`);
-
+        console.log(`Clicking ${modalName} action: ${target.text || "[button]"}`);
         clickElementOrClickableAncestor(target.button);
 
-        const waitStarted = Date.now();
+        const closeStarted = Date.now();
 
-        while (Date.now() - waitStarted < 6500) {
+        while (Date.now() - closeStarted < 7000) {
           await sleep(250);
 
-          const afterText = getVisiblePageTextDeep();
-
-          if (!modalTextRegex.test(afterText)) {
-            await sleep(300);
+          if (!modalOpenCheck()) {
+            await sleep(400);
+            console.log(`${modalName} popup closed.`);
             return true;
           }
         }
 
-        console.warn(`${actionName} was clicked, but the modal is still open. Stopping this action before doing anything else.`);
+        console.warn(`${modalName} action was clicked, but the popup stayed open. Stopping before doing anything else.`);
+        return false;
+      }
+
+      if (!modalOpen && Date.now() - started > 1800) {
+        console.warn(`${modalName} popup was not detected.`);
         return false;
       }
     }
 
+    console.warn(`${modalName} popup timed out.`);
     return false;
   };
 
   const confirmDeleteDialog = async () => {
     return await clickModalAction({
-      modalTextRegex: /delete this message\?/i,
-      actionTextRegex: /^yes,\s*delete$|^yes\s*delete$|^delete$/i,
-      actionName: "Yes, Delete"
+      modalName: "Delete message",
+      modalOpenCheck: isDeleteMessageModalOpen,
+      actionRegex: /^yes,\s*delete$|^yes\s*delete$|^delete$/i
     });
   };
 
-  const clickConfirmHideIfNeeded = async () => {
-    console.log("Waiting for Hide chat confirmation popup...");
+  const confirmHideDialog = async () => {
+    return await clickModalAction({
+      modalName: "Hide chat",
+      modalOpenCheck: isHideChatModalOpen,
+      actionRegex: /^yes,\s*hide$|^yes\s*hide$|^hide$/i
+    });
+  };
 
-    const visibleTextDeep = () => {
-      try {
-        return normalizeText(
-          deepQueryAll(
-            [
-              "dialog",
-              "[role='dialog']",
-              "div",
-              "section",
-              "article",
-              "h1",
-              "h2",
-              "h3",
-              "p",
-              "span",
-              "button",
-              "[role='button']",
-              "rs-button"
-            ].join(",")
-          )
-            .filter(isVisible)
-            .map(getReadableText)
-            .filter(Boolean)
-            .join(" ")
-        );
-      } catch {
-        return "";
-      }
-    };
+  const closeDeleteModalIfStillOpen = async () => {
+    if (!isDeleteMessageModalOpen()) return;
 
-    const hidePopupTextVisible = () => {
-      const bodyText = normalizeText(document.body.innerText);
-      const deepText = visibleTextDeep();
-      const combined = `${bodyText} ${deepText}`;
+    console.warn("Delete popup is still open. Closing it before continuing...");
 
-      return (
-        combined.includes("hide chat?") ||
-        combined.includes("this conversation will be hidden") ||
-        combined.includes("yes, hide") ||
-        combined.includes("yes hide")
-      );
-    };
+    const closeButton = deepQueryAll("button, [role='button']")
+      .filter(isVisible)
+      .find((button) => {
+        const text = normalizeText(getReadableText(button));
+        return text === "cancel" || text === "x" || text === "close";
+      });
 
-    const yesHideButtonVisible = () => {
-      return deepQueryAll("button, [role='button'], rs-button")
-        .filter(isVisible)
-        .map((button) => {
-          const r = button.getBoundingClientRect();
-          const text = normalizeText(getReadableText(button));
-          let background = "";
-
-          try {
-            background = getComputedStyle(button).backgroundColor || "";
-          } catch {}
-
-          return {
-            button,
-            text,
-            r,
-            background
-          };
-        })
-        .filter((item) => {
-          return (
-            item.r.width >= 32 &&
-            item.r.height >= 22 &&
-            item.r.top > 120 &&
-            item.r.bottom < window.innerHeight &&
-            !/^x$|^close$|^cancel$/i.test(item.text)
-          );
-        })
-        .sort((a, b) => {
-          const aExact = /^yes,\s*hide$|^yes\s*hide$/i.test(a.text) ? 10000 : 0;
-          const bExact = /^yes,\s*hide$|^yes\s*hide$/i.test(b.text) ? 10000 : 0;
-
-          const aHide = /hide/i.test(a.text) ? 4000 : 0;
-          const bHide = /hide/i.test(b.text) ? 4000 : 0;
-
-          const aDark = /rgb\(0,\s*0,\s*0\)|rgba\(0,\s*0,\s*0/i.test(a.background) ? 1000 : 0;
-          const bDark = /rgb\(0,\s*0,\s*0\)|rgba\(0,\s*0,\s*0/i.test(b.background) ? 1000 : 0;
-
-          const aScore = aExact + aHide + aDark + a.r.right + a.r.bottom * 0.1;
-          const bScore = bExact + bHide + bDark + b.r.right + b.r.bottom * 0.1;
-
-          return bScore - aScore;
-        })[0]?.button || null;
-    };
-
-    const started = Date.now();
-    let sawPopup = false;
-    let clicked = false;
-
-    while (Date.now() - started < 10000) {
-      await sleep(250);
-
-      const popupVisible = hidePopupTextVisible();
-      const yesHideButton = yesHideButtonVisible();
-
-      if (popupVisible || yesHideButton) {
-        sawPopup = true;
-      }
-
-      if (yesHideButton) {
-        console.log("Clicking Yes, Hide confirmation button...");
-        clickElementOrClickableAncestor(yesHideButton);
-        clicked = true;
-
-        const closeStarted = Date.now();
-
-        while (Date.now() - closeStarted < 5500) {
-          await sleep(250);
-
-          const stillPopup = hidePopupTextVisible();
-          const stillButton = yesHideButtonVisible();
-
-          if (!stillPopup && !stillButton) {
-            console.log("Hide confirmation popup closed.");
-            return true;
-          }
-        }
-
-        console.warn("Clicked Yes, Hide, but the hide confirmation popup still appears to be open.");
-        return false;
-      }
-
-      if (!sawPopup && Date.now() - started > 2500) {
-        console.log("No Hide chat confirmation popup detected after waiting.");
-        return true;
-      }
+    if (closeButton) {
+      clickElementOrClickableAncestor(closeButton);
+      await sleep(700);
     }
-
-    if (sawPopup && !clicked) {
-      console.warn("Hide chat popup appeared, but the Yes, Hide button was not found/clicked.");
-      return false;
-    }
-
-    return !sawPopup;
   };
 
   const isOwnMessage = (eventEl) => {
@@ -970,20 +463,13 @@ JS_TEMPLATE = r"""
     const aria = getAttributeSafe(msg, "aria-label");
     const text = cleanText(getReadableText(eventEl));
 
-    return normalizeText(aria || text).slice(0, 500);
+    return normalizeText(aria || text).slice(0, 700);
   };
 
-  const getOwnMessageEvents = () =>
-    deepQueryAll("rs-timeline-event")
+  const getOwnMessageEvents = () => {
+    return deepQueryAll("rs-timeline-event")
       .filter(isVisible)
       .filter(isOwnMessage);
-
-  const ownMessageSignatureExists = (signature) => {
-    if (!signature) return false;
-
-    return getOwnMessageEvents().some((eventEl) => {
-      return getMessageSignature(eventEl) === signature;
-    });
   };
 
   const findDeleteMenuItem = () => {
@@ -992,39 +478,24 @@ JS_TEMPLATE = r"""
     );
 
     return items.find((el) => {
-      const text = getReadableText(el).toLowerCase();
+      const text = normalizeText(getReadableText(el));
       return isVisible(el) && /delete|remove message/.test(text);
     });
-  };
-
-  const closeDeleteModalIfStillOpen = async () => {
-    if (!isDeleteMessageModalOpen()) return;
-
-    console.warn("Delete modal is still open. Closing it before continuing...");
-
-    const closeButton = deepQueryAll("button, [role='button']")
-      .filter(isVisible)
-      .find((button) => {
-        const text = normalizeText(getReadableText(button));
-        return text === "cancel" || text === "x" || text === "close";
-      });
-
-    if (closeButton) {
-      clickElementOrClickableAncestor(closeButton);
-      await sleep(600);
-    }
   };
 
   const waitUntilMessageReallyGone = async ({ signature, beforeCount }) => {
     const started = Date.now();
 
-    while (Date.now() - started < GONE_CHECK_TIMEOUT_MS) {
-      await sleep(GONE_CHECK_INTERVAL_MS);
+    while (Date.now() - started < GONE_TIMEOUT_MS) {
+      await sleep(GONE_INTERVAL_MS);
 
-      if (isDeleteMessageModalOpen()) continue;
+      if (isDeleteMessageModalOpen()) {
+        continue;
+      }
 
       const currentMessages = getOwnMessageEvents();
       const currentCount = currentMessages.length;
+
       const signatureStillVisible = signature
         ? currentMessages.some((msg) => getMessageSignature(msg) === signature)
         : false;
@@ -1037,8 +508,10 @@ JS_TEMPLATE = r"""
     return false;
   };
 
-  const deleteOne = async (eventEl) => {
+  const deleteOneMessage = async (eventEl) => {
     await closeDeleteModalIfStillOpen();
+
+    if (!eventEl || !isVisible(eventEl)) return false;
 
     const signature = getMessageSignature(eventEl);
     const beforeCount = getOwnMessageEvents().length;
@@ -1082,14 +555,20 @@ JS_TEMPLATE = r"""
         ].join(",")
       );
 
-      if (!more || !isVisible(more)) return false;
+      if (!more || !isVisible(more)) {
+        console.warn("Could not find message More/Delete control.");
+        return false;
+      }
 
       more.click();
       await sleep(MENU_DELAY_MS);
 
       const deleteItem = findDeleteMenuItem();
 
-      if (!deleteItem) return false;
+      if (!deleteItem) {
+        console.warn("Could not find Delete menu item.");
+        return false;
+      }
 
       deleteItem.click();
     }
@@ -1097,19 +576,18 @@ JS_TEMPLATE = r"""
     const confirmed = await confirmDeleteDialog();
 
     if (!confirmed) {
-      console.warn("Delete confirmation was not completed. Not counting this as deleted.");
+      console.warn("Delete was not confirmed. Not counting this message as deleted.");
       return false;
     }
 
     const gone = await waitUntilMessageReallyGone({ signature, beforeCount });
 
     if (!gone) {
-      console.warn("Message still appears to be visible after delete confirmation. Not counting it as deleted.");
+      console.warn("Message still appears visible after confirmed delete. Not counting as deleted.");
       return false;
     }
 
     await sleep(DELETE_DELAY_MS);
-
     return true;
   };
 
@@ -1137,106 +615,98 @@ JS_TEMPLATE = r"""
     const scroller = findChatMessageScroller();
 
     if (scroller) {
-      scroller.scrollTop = 0;
-    } else {
-      window.scrollTo(0, 0);
+      const before = scroller.scrollTop;
+      scroller.scrollTop = Math.max(0, scroller.scrollTop - Math.max(500, scroller.clientHeight * 0.85));
+      await sleep(SCROLL_DELAY_MS);
+      return Math.abs(scroller.scrollTop - before) > 5;
     }
 
+    const before = window.scrollY;
+    window.scrollTo(0, Math.max(0, window.scrollY - 700));
     await sleep(SCROLL_DELAY_MS);
+    return Math.abs(window.scrollY - before) > 5;
   };
 
-  const deleteCurrentChatMessages = async () => {
+  const deleteOpenChatMessages = async () => {
     let deleted = 0;
     let failed = 0;
-    let retryRounds = 0;
-    let noProgressRounds = 0;
-    let lastRemainingSignatures = [];
+    let totalAttempts = 0;
+    let noProgressAttempts = 0;
+    let emptyScrollRounds = 0;
 
-    while (retryRounds < MAX_RETRY_ROUNDS_PER_CHAT) {
-      retryRounds++;
+    console.log("Starting single-chat delete pass...");
+    console.log(`Speed: up to ${MAX_DELETES_PER_MINUTE} deletes per minute.`);
+    console.log("Stop anytime with: window.__redditSingleChatCleanupStop = true");
 
-      console.log(`Retry round ${retryRounds}/${MAX_RETRY_ROUNDS_PER_CHAT} for this chat...`);
+    while (
+      !window.__redditSingleChatCleanupStop &&
+      totalAttempts < MAX_TOTAL_DELETE_ATTEMPTS
+    ) {
+      await closeDeleteModalIfStillOpen();
 
-      let roundDeleted = 0;
-      let roundFailed = 0;
-
-      let ownMessages = getOwnMessageEvents();
-
-      if (ownMessages.length === 0) {
-        await scrollCurrentChatUp();
-        ownMessages = getOwnMessageEvents();
-      }
+      const ownMessages = getOwnMessageEvents();
 
       if (ownMessages.length === 0) {
-        console.log("No visible own messages left in this chat.");
-        break;
-      }
+        const moved = await scrollCurrentChatUp();
 
-      const beforeRoundSignatures = ownMessages.map(getMessageSignature);
+        const afterScrollMessages = getOwnMessageEvents();
 
-      console.log(`Found ${ownMessages.length} visible own message(s) to try deleting.`);
+        if (afterScrollMessages.length === 0) {
+          emptyScrollRounds++;
 
-      for (const msg of ownMessages) {
-        const ok = await deleteOne(msg);
+          console.log(`No visible own messages here. Empty scroll round ${emptyScrollRounds}/${MAX_EMPTY_SCROLL_ROUNDS}.`);
 
-        if (ok) {
-          deleted++;
-          roundDeleted++;
-          console.log(`Deleted ${deleted} total message(s) in this chat...`);
-        } else {
-          failed++;
-          roundFailed++;
-          console.log("Delete attempt failed or message remained visible.");
+          if (!moved || emptyScrollRounds >= MAX_EMPTY_SCROLL_ROUNDS) {
+            break;
+          }
+
+          continue;
         }
 
-        await closeDeleteModalIfStillOpen();
-      }
-
-      await closeDeleteModalIfStillOpen();
-      await scrollCurrentChatUp();
-
-      const remainingEvents = getOwnMessageEvents();
-      const remaining = remainingEvents.length;
-      const remainingSignatures = remainingEvents.map(getMessageSignature);
-
-      console.log(
-        `Round ${retryRounds} done. Deleted this round: ${roundDeleted}. Failed this round: ${roundFailed}. Remaining visible own messages: ${remaining}.`
-      );
-
-      if (remaining === 0) {
-        console.log("All visible own messages are gone in this chat.");
-        break;
-      }
-
-      const sameAsLast =
-        lastRemainingSignatures.length === remainingSignatures.length &&
-        lastRemainingSignatures.every((sig, i) => sig === remainingSignatures[i]);
-
-      const sameAsBefore =
-        beforeRoundSignatures.length === remainingSignatures.length &&
-        beforeRoundSignatures.every((sig, i) => sig === remainingSignatures[i]);
-
-      if (roundDeleted === 0 || sameAsLast || sameAsBefore) {
-        noProgressRounds++;
+        emptyScrollRounds = 0;
       } else {
-        noProgressRounds = 0;
+        emptyScrollRounds = 0;
       }
 
-      lastRemainingSignatures = remainingSignatures;
+      const refreshedMessages = getOwnMessageEvents();
 
-      if (noProgressRounds >= MAX_NO_PROGRESS_ROUNDS) {
-        console.warn("Stopping this chat because repeated rounds made no real progress.");
-        break;
+      if (refreshedMessages.length === 0) continue;
+
+      // Delete one message at a time, then re-scan.
+      // Bottom-most visible message tends to be the least disruptive in Reddit chat.
+      const targetMessage = refreshedMessages[refreshedMessages.length - 1];
+
+      totalAttempts++;
+
+      console.log(`Deleting visible own message attempt ${totalAttempts}...`);
+
+      const ok = await deleteOneMessage(targetMessage);
+
+      if (ok) {
+        deleted++;
+        noProgressAttempts = 0;
+        console.log(`Deleted ${deleted} message(s) in this chat.`);
+      } else {
+        failed++;
+        noProgressAttempts++;
+        console.warn(`Delete attempt failed. No-progress count ${noProgressAttempts}/${MAX_NO_PROGRESS_ATTEMPTS}.`);
+
+        if (noProgressAttempts >= MAX_NO_PROGRESS_ATTEMPTS) {
+          console.warn("Stopping delete pass because repeated attempts made no progress.");
+          break;
+        }
+
+        await sleep(700);
       }
-
-      await sleep(700);
     }
 
-    return { deleted, failed };
+    await closeDeleteModalIfStillOpen();
+
+    return { deleted, failed, totalAttempts };
   };
 
   const isWelcomeScreen = () => {
-    const bodyText = normalizeText(document.body.innerText);
+    const bodyText = getVisiblePageTextDeep();
     return bodyText.includes("welcome to chat") && bodyText.includes("start a direct or group chat");
   };
 
@@ -1275,9 +745,9 @@ JS_TEMPLATE = r"""
 
         return (
           r.top >= 0 &&
-          r.top < 85 &&
+          r.top < 90 &&
           r.left > sidebarRight() &&
-          r.right > window.innerWidth - 180 &&
+          r.right > window.innerWidth - 190 &&
           r.width >= 14 &&
           r.height >= 14
         );
@@ -1292,243 +762,16 @@ JS_TEMPLATE = r"""
     return topRightButtons[0] || null;
   };
 
-  const waitForChatOpen = async () => {
-    const started = Date.now();
-
-    while (Date.now() - started < 5000) {
-      await sleep(250);
-
-      if (!isWelcomeScreen() && findChatSettingsGear()) {
-        return true;
-      }
-
-      const bodyText = normalizeText(document.body.innerText);
-
-      if (!isWelcomeScreen() && bodyText.includes("message")) {
-        return true;
-      }
-    }
-
-    return false;
-  };
-
-  const tryClickBackButton = async () => {
-    const possibleBackButtons = deepQueryAll(
-      [
-        'button[aria-label*="back" i]',
-        '[role="button"][aria-label*="back" i]',
-        'button[title*="back" i]',
-        '[aria-label="Back"]',
-        '[title="Back"]',
-        'rs-icon-button[icon="back"]',
-        'rs-icon-button[name="back"]'
-      ].join(",")
-    ).filter(isVisible);
-
-    if (possibleBackButtons.length === 0) return false;
-
-    possibleBackButtons[0].click();
-    await sleep(SIDEBAR_RECOVERY_DELAY_MS);
-
-    return getChatCandidates().length > 0;
-  };
-
-  const tryHistoryBack = async () => {
-    try {
-      history.back();
-      await sleep(SIDEBAR_RECOVERY_DELAY_MS);
-      return getChatCandidates().length > 0;
-    } catch {
-      return false;
-    }
-  };
-
-  const returnToChatListIfNeeded = async () => {
-    let chats = getChatCandidates();
-
-    if (chats.length > 0) return true;
-
-    console.warn("Chat list is not visible. Trying to return to the chat list...");
-
-    const clickedBack = await tryClickBackButton();
-
-    if (clickedBack) {
-      console.log("Returned to chat list using a visible Back button.");
-      return true;
-    }
-
-    const historyWorked = await tryHistoryBack();
-
-    if (historyWorked) {
-      console.log("Returned to chat list using browser history.");
-      return true;
-    }
-
-    console.warn("Still cannot see the chat list. Widen the Reddit window or undock DevTools, then run again.");
-    return false;
-  };
-
-  const getUsefulChatName = (chatText) => {
-    const cleaned = cleanText(chatText)
-      .replace(/^\d+\.\s*/, "")
-      .replace(/^\[deleted chat\]\s*/i, "");
-
-    const withoutDate = cleaned
-      .replace(/\bjan\b.*$/i, "")
-      .replace(/\bfeb\b.*$/i, "")
-      .replace(/\bmar\b.*$/i, "")
-      .replace(/\bapr\b.*$/i, "")
-      .replace(/\bmay\b.*$/i, "")
-      .replace(/\bjun\b.*$/i, "")
-      .replace(/\bjul\b.*$/i, "")
-      .replace(/\baug\b.*$/i, "")
-      .replace(/\bsep\b.*$/i, "")
-      .replace(/\boct\b.*$/i, "")
-      .replace(/\bnov\b.*$/i, "")
-      .replace(/\bdec\b.*$/i, "")
-      .trim();
-
-    return withoutDate || cleaned;
-  };
-
-  const chatTextMatchScore = (candidate, savedChat) => {
-    const candidateRaw = normalizeText(candidate.rawText || candidate.text || "");
-    const candidateText = normalizeText(candidate.text || "");
-    const savedRaw = normalizeText(savedChat.rawText || savedChat.text || "");
-    const savedText = normalizeText(savedChat.text || "");
-    const savedName = normalizeText(getUsefulChatName(savedChat.rawText || savedChat.text || ""));
-    const candidateName = normalizeText(getUsefulChatName(candidate.rawText || candidate.text || ""));
-
-    let score = 0;
-
-    if (savedChat.href && candidate.href && savedChat.href === candidate.href) score += 100000;
-    if (savedChat.key && candidate.key && savedChat.key === candidate.key) score += 40000;
-
-    if (savedRaw && candidateRaw === savedRaw) score += 30000;
-    if (savedText && candidateText === savedText) score += 25000;
-
-    if (savedRaw && candidateRaw.includes(savedRaw)) score += 12000;
-    if (savedRaw && savedRaw.includes(candidateRaw)) score += 8000;
-
-    if (savedName && candidateName === savedName) score += 15000;
-    if (savedName && candidateName.includes(savedName)) score += 9000;
-    if (savedName && savedName.includes(candidateName)) score += 6000;
-
-    if (savedChat.normalizedText?.includes("[deleted]") && candidate.normalizedText?.includes("[deleted]")) {
-      score += 12000;
-    }
-
-    // Date/name rows can shift after hiding. Position is only a weak fallback now.
-    if (savedChat.top != null && candidate.top != null) {
-      const distance = Math.abs(candidate.top - savedChat.top);
-      if (distance < 8) score += 2000;
-      else if (distance < 26) score += 500;
-    }
-
-    return score;
-  };
-
-  const findChatElementFromSavedChat = async (savedChat) => {
-    await returnToChatListIfNeeded();
-
-    const candidates = getChatCandidates();
-
-    let best = candidates
-      .map((chat) => ({
-        chat,
-        score: chatTextMatchScore(chat, savedChat)
-      }))
-      .filter((item) => item.score > 0)
-      .sort((a, b) => b.score - a.score)[0]?.chat || null;
-
-    if (best && best.element && isVisible(best.element)) {
-      return best.element;
-    }
-
-    return null;
-  };
-
-  const tryClickChatRowAndWait = async (rowEl, savedChat) => {
-    if (!rowEl || !isVisible(rowEl)) return false;
-
-    rowEl.scrollIntoView({ block: "center" });
-    await sleep(250);
-
-    const r = rowEl.getBoundingClientRect();
-
-    const y = r.top + r.height / 2;
-
-    const clickPoints = [
-      // Text area first. This avoids the hover pin/action icon that can appear on the row.
-      [Math.min(Math.max(r.left + 145, 18), Math.min(r.right - 20, sidebarRight() - 20)), y],
-      [Math.min(Math.max(r.left + 215, 18), Math.min(r.right - 20, sidebarRight() - 20)), y],
-      [Math.min(Math.max(r.left + 75, 18), Math.min(r.right - 20, sidebarRight() - 20)), y],
-      [Math.min(Math.max(r.left + 30, 18), Math.min(r.right - 20, sidebarRight() - 20)), y]
-    ];
-
-    for (const [x, pointY] of clickPoints) {
-      clickAt(x, pointY);
-
-      const opened = await waitForChatOpen();
-
-      if (opened) return true;
-
-      await sleep(350);
-    }
-
-    return false;
-  };
-
-  const clickChat = async (savedChat) => {
-    console.log(`Opening selected chat: ${savedChat.text || savedChat.rawText || savedChat.key}`);
-
-    await closeDeleteModalIfStillOpen();
-
-    for (let attempt = 1; attempt <= 4; attempt++) {
-      const chatEl = await findChatElementFromSavedChat(savedChat);
-
-      if (chatEl) {
-        const opened = await tryClickChatRowAndWait(chatEl, savedChat);
-
-        if (opened) {
-          console.log("Chat opened.");
-          return true;
-        }
-      } else if (savedChat.clickX != null && savedChat.clickY != null) {
-        console.warn(`Could not rematch row on attempt ${attempt}. Trying saved coordinates as last resort...`);
-
-        clickAt(savedChat.clickX, savedChat.clickY);
-
-        const opened = await waitForChatOpen();
-
-        if (opened) {
-          console.log("Chat opened.");
-          return true;
-        }
-      } else {
-        console.warn(`Could not find chat row on attempt ${attempt}.`);
-      }
-
-      console.warn(`Chat did not open on attempt ${attempt}. Re-scanning sidebar and retrying...`);
-      await sleep(700);
-    }
-
-    console.warn(`Could not open chat after retries: ${savedChat.text || savedChat.rawText || savedChat.key}`);
-    return false;
-  };
-
   const openChatSettings = async () => {
-    console.log("Trying to open chat settings...");
-
     await closeDeleteModalIfStillOpen();
 
     if (isWelcomeScreen()) {
-      console.warn("Cannot open settings because no chat is currently open.");
+      console.warn("Cannot open settings because no chat appears to be open.");
       return false;
     }
 
     const alreadySettings = findVisibleByText(
-      ['h1', 'h2', 'h3', 'div', 'span'].join(","),
+      "h1, h2, h3, div, span",
       /^chat settings$/i
     );
 
@@ -1539,13 +782,31 @@ JS_TEMPLATE = r"""
 
     const gear = findChatSettingsGear();
 
-    if (gear) {
-      clickElementOrClickableAncestor(gear);
-      await sleep(800);
-      return true;
+    if (!gear) {
+      console.warn("Could not find top-right chat settings gear.");
+      return false;
     }
 
-    console.warn("Could not find the top-right chat settings gear.");
+    console.log("Opening chat settings...");
+    clickElementOrClickableAncestor(gear);
+
+    const started = Date.now();
+
+    while (Date.now() - started < 5000) {
+      await sleep(250);
+
+      const settingsHeader = findVisibleByText(
+        "h1, h2, h3, div, span",
+        /^chat settings$/i
+      );
+
+      if (settingsHeader) {
+        console.log("Chat settings opened.");
+        return true;
+      }
+    }
+
+    console.warn("Clicked gear, but Chat settings did not appear.");
     return false;
   };
 
@@ -1569,271 +830,87 @@ JS_TEMPLATE = r"""
   };
 
   const hideCurrentChat = async () => {
-    console.log("Trying to hide current chat via gear → Hide chat → Yes, Hide...");
-
     await closeDeleteModalIfStillOpen();
 
     if (isWelcomeScreen()) {
-      console.warn("Skipping hide because the chat did not open.");
+      console.warn("Skipping hide because no chat appears to be open.");
       return false;
     }
 
-    const openedSettings = await openChatSettings();
+    const settingsOpened = await openChatSettings();
 
-    if (!openedSettings) {
-      console.warn("Could not open chat settings.");
-      return false;
-    }
+    if (!settingsOpened) return false;
 
-    await sleep(700);
+    await sleep(500);
 
     const hideButton = findHideChatButton();
 
     if (!hideButton) {
-      console.warn("Could not find Hide chat on the settings screen.");
+      console.warn("Could not find Hide chat button on settings screen.");
       return false;
     }
 
     console.log("Clicking Hide chat...");
     clickElementOrClickableAncestor(hideButton);
 
-    const confirmed = await clickConfirmHideIfNeeded();
+    const confirmed = await confirmHideDialog();
 
     if (!confirmed) {
-      console.warn("Hide chat confirmation was not completed.");
+      console.warn("Hide was not confirmed.");
       return false;
     }
 
-    await sleep(1200);
+    await sleep(HIDE_DELAY_MS);
 
-    console.log("Hide chat confirmed.");
+    console.log("Hide confirmed.");
     return true;
   };
 
-  const showChatPicker = async () => {
-    const chats = getChatCandidates();
+  console.log("Single open-chat cleanup started.");
+  console.log("Make sure the chat you want is already open.");
+  console.log(`Username: ${USERNAME}`);
 
-    if (chats.length === 0) {
-      alert(
-        "No chats found. Make sure you are on a Reddit chat page and the left chat sidebar is visible. Try widening the window, undocking DevTools, or scrolling the sidebar, then run the script again."
-      );
-      return [];
-    }
-
-    return new Promise((resolve) => {
-      const old = document.getElementById("reddit-chat-delete-picker");
-      if (old) old.remove();
-
-      const overlay = document.createElement("div");
-      overlay.id = "reddit-chat-delete-picker";
-
-      overlay.style.position = "fixed";
-      overlay.style.inset = "0";
-      overlay.style.background = "rgba(0, 0, 0, 0.65)";
-      overlay.style.zIndex = "2147483647";
-      overlay.style.display = "flex";
-      overlay.style.alignItems = "center";
-      overlay.style.justifyContent = "center";
-      overlay.style.fontFamily = "Arial, sans-serif";
-
-      const panel = document.createElement("div");
-      panel.style.width = "min(900px, 92vw)";
-      panel.style.maxHeight = "82vh";
-      panel.style.overflow = "auto";
-      panel.style.background = "#fff";
-      panel.style.color = "#111";
-      panel.style.borderRadius = "12px";
-      panel.style.padding = "18px";
-      panel.style.boxShadow = "0 10px 40px rgba(0,0,0,0.35)";
-
-      panel.innerHTML = `
-        <h2 style="margin:0 0 8px;font-size:20px;">Select Reddit chats to clean</h2>
-        <p style="margin:0 0 12px;font-size:14px;line-height:1.4;">
-          Found ${chats.length} visible chat item(s). Select the chats you want to process.
-          This will delete only messages sent by <b>${USERNAME}</b>.
-        </p>
-
-        <p style="margin:0 0 12px;font-size:13px;line-height:1.4;color:#555;">
-          This version only counts a message as deleted after the confirmation popup closes and
-          the same message is no longer visible.
-        </p>
-
-        <p style="margin:0 0 12px;font-size:13px;line-height:1.4;color:#555;">
-          Hide after cleaning: <b>${HIDE_AFTER_DELETE ? "ON" : "OFF"}</b>
-        </p>
-
-        <div style="display:flex;gap:8px;margin-bottom:12px;">
-          <button id="rcc-select-all" style="padding:8px 10px;cursor:pointer;">Select all</button>
-          <button id="rcc-select-none" style="padding:8px 10px;cursor:pointer;">Select none</button>
-        </div>
-
-        <div id="rcc-list" style="border:1px solid #ddd;border-radius:8px;overflow:hidden;"></div>
-
-        <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:14px;">
-          <button id="rcc-cancel" style="padding:10px 14px;cursor:pointer;">Cancel</button>
-          <button id="rcc-run" style="padding:10px 14px;cursor:pointer;background:#ff4500;color:#fff;border:0;border-radius:6px;">
-            Delete/hide selected chats
-          </button>
-        </div>
-      `;
-
-      const list = panel.querySelector("#rcc-list");
-
-      chats.forEach((chat, index) => {
-        const row = document.createElement("label");
-        row.style.display = "flex";
-        row.style.alignItems = "flex-start";
-        row.style.gap = "10px";
-        row.style.padding = "10px";
-        row.style.borderBottom = "1px solid #eee";
-        row.style.cursor = "pointer";
-        row.style.fontSize = "14px";
-
-        const checkbox = document.createElement("input");
-        checkbox.type = "checkbox";
-        checkbox.checked = false;
-        checkbox.dataset.index = String(index);
-        checkbox.style.marginTop = "3px";
-
-        const label = document.createElement("span");
-        label.textContent = `${index + 1}. ${chat.text}`;
-
-        row.appendChild(checkbox);
-        row.appendChild(label);
-        list.appendChild(row);
-      });
-
-      overlay.appendChild(panel);
-      document.body.appendChild(overlay);
-
-      const closeWith = (selected) => {
-        overlay.remove();
-        resolve(selected);
-      };
-
-      panel.querySelector("#rcc-select-all").onclick = () => {
-        panel.querySelectorAll('input[type="checkbox"]').forEach((box) => {
-          box.checked = true;
-        });
-      };
-
-      panel.querySelector("#rcc-select-none").onclick = () => {
-        panel.querySelectorAll('input[type="checkbox"]').forEach((box) => {
-          box.checked = false;
-        });
-      };
-
-      panel.querySelector("#rcc-cancel").onclick = () => {
-        closeWith([]);
-      };
-
-      panel.querySelector("#rcc-run").onclick = () => {
-        const selectedIndexes = [...panel.querySelectorAll('input[type="checkbox"]')]
-          .filter((box) => box.checked)
-          .map((box) => Number(box.dataset.index));
-
-        const selected = selectedIndexes.map((i) => ({
-          key: chats[i].key,
-          text: chats[i].text,
-          rawText: chats[i].rawText,
-          normalizedText: chats[i].normalizedText,
-          href: chats[i].href,
-          top: chats[i].top,
-          bottom: chats[i].bottom,
-          clickX: chats[i].clickX,
-          clickY: chats[i].clickY
-        }));
-
-        closeWith(selected);
-      };
-    });
-  };
-
-  console.log("Scanning visible chats...");
-  console.log("Current URL:", location.href);
-  console.log("Tip: this version verifies real delete progress and closes stuck delete popups.");
-  console.log("Tip: scroll the left chat sidebar before running if you want more chats to appear.");
-  console.log(`Retry settings: ${MAX_RETRY_ROUNDS_PER_CHAT} retry rounds per chat, stop after ${MAX_NO_PROGRESS_ROUNDS} no-progress rounds.`);
-  console.log(`Hide after delete: ${HIDE_AFTER_DELETE ? "ON" : "OFF"}`);
-
-  const selectedChatsRaw = await showChatPicker();
-
-  if (!selectedChatsRaw.length) {
-    console.log("No chats selected. Cancelled.");
+  if (isWelcomeScreen()) {
+    console.warn("This looks like Reddit's Welcome to chat screen, not an open chat. Open one chat first, then run again.");
     return;
   }
 
-  // Process top-down in the same order shown in the picker.
-  // After every hide, the script re-scans the visible sidebar and matches the next chat by text.
-  const selectedChats = selectedChatsRaw;
+  const deleteResult = await deleteOpenChatMessages();
 
-  console.log(`Selected ${selectedChats.length} chat(s).`);
-  console.log(`Speed: up to ${MAX_DELETES_PER_MINUTE} deletes per minute.`);
+  console.log("Delete pass finished.");
+  console.log(`Deleted: ${deleteResult.deleted}`);
+  console.log(`Failed/skipped delete attempts: ${deleteResult.failed}`);
+  console.log(`Total delete attempts: ${deleteResult.totalAttempts}`);
 
-  let totalDeleted = 0;
-  let totalFailed = 0;
-  let totalHidden = 0;
-  let totalHideFailed = 0;
-  let totalOpenFailed = 0;
-  let processedChats = 0;
+  if (window.__redditSingleChatCleanupStop) {
+    console.warn("Stopped by user before hide step.");
+    return;
+  }
 
-  for (const chat of selectedChats) {
-    const opened = await clickChat(chat);
+  if (!HIDE_AFTER_DELETE) {
+    console.log("Hide step disabled in Streamlit settings.");
+    return;
+  }
 
-    if (!opened) {
-      totalOpenFailed++;
-      console.warn(`Skipping because chat did not open: ${chat.text}`);
-      continue;
-    }
+  let shouldHide = true;
 
-    processedChats++;
-
-    console.log(`Cleaning selected chat ${processedChats}/${selectedChats.length}: ${chat.text}`);
-
-    const result = await deleteCurrentChatMessages();
-
-    totalDeleted += result.deleted;
-    totalFailed += result.failed;
-
-    console.log(
-      `Finished chat: ${chat.text}. Deleted: ${result.deleted}. Failed/skipped attempts: ${result.failed}.`
+  if (ASK_BEFORE_HIDE) {
+    shouldHide = confirm(
+      `Delete pass finished.\n\nDeleted: ${deleteResult.deleted}\nFailed/skipped: ${deleteResult.failed}\n\nHide this chat now?`
     );
-
-    if (HIDE_AFTER_DELETE) {
-      const hidden = await hideCurrentChat();
-
-      if (hidden) {
-        totalHidden++;
-        console.log(`Hidden chat: ${chat.text}`);
-      } else {
-        totalHideFailed++;
-        console.warn(`Could not hide chat: ${chat.text}`);
-      }
-
-      await sleep(1000);
-    }
-
-    await returnToChatListIfNeeded();
   }
 
-  console.log("Selected-chat cleanup finished.");
-  console.log(`Chats processed: ${processedChats}`);
-  console.log(`Chats that failed to open: ${totalOpenFailed}`);
-  console.log(`Total deleted: ${totalDeleted}`);
-  console.log(`Total skipped/failed delete attempts: ${totalFailed}`);
-  console.log(`Total hidden: ${totalHidden}`);
-  console.log(`Total hide failures: ${totalHideFailed}`);
-
-  if (totalFailed > 0) {
-    console.log("If messages failed, Reddit may not be confirming deletion. Try slower speed like 40 or 50.");
+  if (!shouldHide) {
+    console.log("Hide cancelled by user.");
+    return;
   }
 
-  if (totalOpenFailed > 0) {
-    console.log("If chats fail to open, select fewer at a time or run again after scrolling that section into view.");
-  }
+  const hidden = await hideCurrentChat();
 
-  if (totalHideFailed > 0) {
-    console.log("If hiding failed, the chat may not have opened or Reddit's gear/settings layout changed.");
+  if (hidden) {
+    console.log("Done. Current chat was hidden.");
+  } else {
+    console.warn("Delete pass finished, but hiding failed. Try hiding manually from Gear -> Hide chat.");
   }
 })();
 """
@@ -1846,39 +923,42 @@ if generate:
             JS_TEMPLATE
             .replace("__USERNAME_JSON__", json.dumps(username.strip()))
             .replace("__MAX_DELETES__", str(int(speed)))
-            .replace("__MAX_RETRY_ROUNDS__", str(int(retry_rounds)))
-            .replace("__MAX_NO_PROGRESS_ROUNDS__", str(int(no_progress_rounds)))
+            .replace("__MAX_TOTAL_DELETE_ATTEMPTS__", str(int(max_total_attempts)))
+            .replace("__MAX_NO_PROGRESS_ATTEMPTS__", str(int(max_no_progress_attempts)))
+            .replace("__MAX_EMPTY_SCROLL_ROUNDS__", str(int(max_empty_scroll_rounds)))
             .replace("__HIDE_AFTER_DELETE__", "true" if hide_after_delete else "false")
+            .replace("__ASK_BEFORE_HIDE__", "true" if ask_before_hide else "false")
             .strip()
         )
 
-        st.success("Script generated.")
+        st.success("Script generated for the currently open Reddit chat.")
 
         st.markdown(
             """
-            **How to use it:**
+            **How to run it:**
 
-            1. Open Reddit Chat.
-            2. Make sure the left chat sidebar is visible.
-            3. Scroll the left sidebar until the chats you want are visible.
-            4. Open DevTools.
-            5. Go to the **Console** tab.
-            6. Paste the generated script.
-            7. Select the chats in the popup.
-            8. Click **Delete/hide selected chats**.
+            1. On Reddit, open the single chat you want to clean.
+            2. Open DevTools.
+            3. Go to the **Console** tab.
+            4. Paste the script below.
+            5. Press Enter.
 
-            This version fixes the hide confirmation popup. It waits for and clicks **Yes, Hide** before moving on.
+            Stop while it is running with:
+
+            ```js
+            window.__redditSingleChatCleanupStop = true
+            ```
             """
         )
 
         st.code(script, language="javascript")
 
         st.download_button(
-            label="Download script as .js",
+            label="Download generated script as .js",
             data=script,
-            file_name="reddit_selected_chat_delete_hide_yes_hide_fix.js",
+            file_name="reddit_single_open_chat_delete_hide.js",
             mime="text/javascript",
             use_container_width=True
         )
 else:
-    st.info("Enter your Reddit username and click the button to generate the script.")
+    st.info("Enter your username and click the button to generate the single-chat script.")
